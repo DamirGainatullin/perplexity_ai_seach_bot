@@ -2,10 +2,8 @@ import asyncio
 import json
 import sqlite3
 import sys
-from dataclasses import dataclass
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable
 from urllib import error, parse, request
 
 
@@ -13,18 +11,15 @@ BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
 PROMPTS_DIR = BASE_DIR / "prompts"
 DB_PATH = BASE_DIR / "weekly_bot.sqlite3"
-PERPLEXITY_URL = "https://api.perplexity.ai/chat/completions"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/{method}"
 MAX_TELEGRAM_MESSAGE_LENGTH = 4000
-WEEKDAY_NAMES = {
-    0: "понедельник",
-    1: "вторник",
-    2: "среда",
-    3: "четверг",
-    4: "пятница",
-    5: "суббота",
-    6: "воскресенье",
-}
+DEFAULT_MODEL = "perplexity/sonar-pro"
+DEFAULT_SEARCH_TYPE = "auto"
+DEFAULT_DAY = 0
+DEFAULT_TIME = "09:00"
+DEFAULT_TZ = "Europe/Moscow"
+SYSTEM_PROMPT = "Ты готовишь аккуратную еженедельную новостную сводку на русском языке."
 
 
 def load_env(path: Path) -> dict[str, str]:
@@ -47,76 +42,11 @@ def read_prompt(path: Path) -> str:
             return path.read_text(encoding=encoding).strip()
         except UnicodeDecodeError:
             continue
-    raise UnicodeDecodeError("prompt", b"", 0, 1, f"Unable to decode {path}")
+    raise RuntimeError(f"Cannot decode prompt file: {path}")
 
 
-def split_message(text: str, limit: int = MAX_TELEGRAM_MESSAGE_LENGTH) -> list[str]:
-    if len(text) <= limit:
-        return [text]
-
-    chunks: list[str] = []
-    current = ""
-    for block in text.split("\n\n"):
-        candidate = block if not current else f"{current}\n\n{block}"
-        if len(candidate) <= limit:
-            current = candidate
-            continue
-
-        if current:
-            chunks.append(current)
-            current = ""
-
-        while len(block) > limit:
-            split_at = block.rfind("\n", 0, limit)
-            if split_at <= 0:
-                split_at = limit
-            chunks.append(block[:split_at].strip())
-            block = block[split_at:].strip()
-        current = block
-
-    if current:
-        chunks.append(current)
-    return chunks
-
-
-def format_schedule(day: int, run_time: time) -> str:
-    return f"{WEEKDAY_NAMES[day]} в {run_time.strftime('%H:%M')}"
-
-
-@dataclass(slots=True)
-class Settings:
-    bot_token: str
-    perplexity_api_token: str
-    perplexity_model: str
-    schedule_day: int
-    schedule_time: time
-    timezone: timezone
-
-    @classmethod
-    def from_env(cls) -> "Settings":
-        env = load_env(ENV_PATH)
-        bot_token = env.get("BOT_TOKEN", "")
-        perplexity_api_token = env.get("PERPLEXITY_API_TOKEN", "")
-        if not bot_token or not perplexity_api_token:
-            raise RuntimeError("BOT_TOKEN и PERPLEXITY_API_TOKEN должны быть заданы в .env")
-
-        model = env.get("PERPLEXITY_MODEL", "sonar-pro")
-        schedule_day = int(env.get("WEEKLY_SEND_DAY", "0"))
-        schedule_time = datetime.strptime(env.get("WEEKLY_SEND_TIME", "09:00"), "%H:%M").time()
-        timezone_name = env.get("TZ", "Europe/Moscow")
-        timezone_value = resolve_timezone(timezone_name)
-        return cls(
-            bot_token=bot_token,
-            perplexity_api_token=perplexity_api_token,
-            perplexity_model=model,
-            schedule_day=schedule_day,
-            schedule_time=schedule_time,
-            timezone=timezone_value,
-        )
-
-
-def resolve_timezone(timezone_name: str) -> timezone:
-    normalized = timezone_name.strip()
+def resolve_timezone(tz_name: str) -> timezone:
+    normalized = (tz_name or "").strip()
     if normalized in {"Europe/Moscow", "MSK", "UTC+3", "+03:00", "+03"}:
         return timezone(timedelta(hours=3))
     if normalized in {"UTC", "Etc/UTC", "+00:00", "+00"}:
@@ -149,283 +79,399 @@ def resolve_timezone(timezone_name: str) -> timezone:
     return timezone(offset)
 
 
-class ChatRepository:
-    def __init__(self, db_path: Path) -> None:
-        self.db_path = db_path
-        self._initialize()
+def get_prompt_commands() -> dict[str, Path]:
+    commands: dict[str, Path] = {}
+    for path in sorted(PROMPTS_DIR.glob("*.txt")):
+        command = f"/{path.stem.lower()}"
+        commands[command] = path
+    return commands
 
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path)
-        connection.row_factory = sqlite3.Row
-        return connection
 
-    def _initialize(self) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS chats (
-                    chat_id INTEGER PRIMARY KEY,
-                    created_at TEXT NOT NULL
-                )
-                """
+def split_message(text: str, limit: int = MAX_TELEGRAM_MESSAGE_LENGTH) -> list[str]:
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    current = ""
+    for block in text.split("\n\n"):
+        candidate = block if not current else f"{current}\n\n{block}"
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+
+        if current:
+            chunks.append(current)
+            current = ""
+
+        while len(block) > limit:
+            split_at = block.rfind("\n", 0, limit)
+            if split_at <= 0:
+                split_at = limit
+            chunks.append(block[:split_at].strip())
+            block = block[split_at:].strip()
+        current = block
+
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def db_init() -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chats (
+                chat_id INTEGER PRIMARY KEY,
+                created_at TEXT NOT NULL
             )
-
-    def add_chat(self, chat_id: int) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO chats (chat_id, created_at)
-                VALUES (?, ?)
-                ON CONFLICT(chat_id) DO NOTHING
-                """,
-                (chat_id, datetime.utcnow().isoformat(timespec="seconds")),
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS prompt_cache (
+                prompt_name TEXT NOT NULL,
+                cache_date TEXT NOT NULL,
+                response TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (prompt_name, cache_date)
             )
-
-    def get_all_chat_ids(self) -> list[int]:
-        with self._connect() as connection:
-            rows = connection.execute("SELECT chat_id FROM chats ORDER BY created_at ASC").fetchall()
-        return [int(row["chat_id"]) for row in rows]
-
-
-class TelegramBotAPI:
-    def __init__(self, token: str) -> None:
-        self.token = token
-
-    def _request(self, method: str, payload: dict | None = None) -> dict:
-        url = TELEGRAM_API_URL.format(token=self.token, method=method)
-        body = None
-        headers = {}
-        if payload is not None:
-            body = json.dumps(payload).encode("utf-8")
-            headers["Content-Type"] = "application/json"
-
-        http_request = request.Request(url, data=body, headers=headers, method="POST" if payload else "GET")
-        try:
-            with request.urlopen(http_request, timeout=60) as response:
-                data = json.loads(response.read().decode("utf-8"))
-        except error.HTTPError as exc:
-            details = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Telegram API error {exc.code}: {details}") from exc
-        except error.URLError as exc:
-            raise RuntimeError(f"Telegram network error: {exc}") from exc
-
-        if not data.get("ok"):
-            raise RuntimeError(f"Telegram API returned error: {data}")
-        return data["result"]
-
-    async def get_updates(self, offset: int | None = None, timeout: int = 30) -> list[dict]:
-        params = {"timeout": timeout}
-        if offset is not None:
-            params["offset"] = offset
-        query = parse.urlencode(params)
-        url = TELEGRAM_API_URL.format(token=self.token, method=f"getUpdates?{query}")
-        http_request = request.Request(url, method="GET")
-
-        def _perform() -> list[dict]:
-            try:
-                with request.urlopen(http_request, timeout=timeout + 10) as response:
-                    data = json.loads(response.read().decode("utf-8"))
-            except error.HTTPError as exc:
-                details = exc.read().decode("utf-8", errors="replace")
-                raise RuntimeError(f"Telegram polling error {exc.code}: {details}") from exc
-            except error.URLError as exc:
-                raise RuntimeError(f"Telegram polling network error: {exc}") from exc
-            if not data.get("ok"):
-                raise RuntimeError(f"Telegram polling returned error: {data}")
-            return data["result"]
-
-        return await asyncio.to_thread(_perform)
-
-    async def send_text(self, chat_id: int, text: str) -> None:
-        for chunk in split_message(text):
-            await asyncio.to_thread(
-                self._request,
-                "sendMessage",
-                {"chat_id": chat_id, "text": chunk, "disable_web_page_preview": True},
-            )
-
-
-class PerplexityClient:
-    def __init__(self, api_token: str, model: str) -> None:
-        self.api_token = api_token
-        self.model = model
-
-    async def ask(self, prompt: str) -> str:
-        payload = {
-            "model": self.model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "Ты готовишь аккуратную еженедельную новостную сводку на русском языке.",
-                },
-                {"role": "user", "content": prompt},
-            ],
-        }
-
-        def _perform() -> str:
-            http_request = request.Request(
-                PERPLEXITY_URL,
-                data=json.dumps(payload).encode("utf-8"),
-                headers={
-                    "Authorization": f"Bearer {self.api_token}",
-                    "Content-Type": "application/json",
-                },
-                method="POST",
-            )
-            try:
-                with request.urlopen(http_request, timeout=180) as response:
-                    data = json.loads(response.read().decode("utf-8"))
-            except error.HTTPError as exc:
-                details = exc.read().decode("utf-8", errors="replace")
-                raise RuntimeError(f"Perplexity API error {exc.code}: {details}") from exc
-            except error.URLError as exc:
-                raise RuntimeError(f"Perplexity network error: {exc}") from exc
-
-            try:
-                return data["choices"][0]["message"]["content"].strip()
-            except (KeyError, IndexError, TypeError) as exc:
-                raise RuntimeError(f"Unexpected Perplexity response: {data}") from exc
-
-        return await asyncio.to_thread(_perform)
-
-
-class WeeklyDigestService:
-    def __init__(self, prompts_dir: Path, perplexity_client: PerplexityClient) -> None:
-        self.prompts_dir = prompts_dir
-        self.perplexity_client = perplexity_client
-        self._generation_lock = asyncio.Lock()
-
-    def _iter_prompt_files(self) -> Iterable[Path]:
-        return sorted(self.prompts_dir.glob("*.txt"))
-
-    async def generate_digest(self) -> str:
-        prompt_files = list(self._iter_prompt_files())
-        if not prompt_files:
-            raise RuntimeError("В папке prompts не найдено ни одного .txt файла")
-
-        async with self._generation_lock:
-            sections: list[str] = []
-            for prompt_file in prompt_files:
-                prompt_text = read_prompt(prompt_file)
-                answer = await self.perplexity_client.ask(prompt_text)
-                sections.append(f"{prompt_file.stem.upper()}\n\n{answer}")
-
-        timestamp = datetime.now().strftime("%d.%m.%Y %H:%M")
-        return f"Еженедельная сводка\nСформировано: {timestamp}\n\n" + "\n\n".join(sections)
-
-
-class WeeklyBotApp:
-    def __init__(
-        self,
-        settings: Settings,
-        repository: ChatRepository,
-        telegram_api: TelegramBotAPI,
-        digest_service: WeeklyDigestService,
-    ) -> None:
-        self.settings = settings
-        self.repository = repository
-        self.telegram_api = telegram_api
-        self.digest_service = digest_service
-        self._update_offset: int | None = None
-
-    async def run(self) -> None:
-        await asyncio.gather(
-            self._poll_updates_forever(),
-            self._weekly_scheduler_forever(),
+            """
         )
 
-    async def _poll_updates_forever(self) -> None:
-        while True:
-            try:
-                updates = await self.telegram_api.get_updates(offset=self._update_offset, timeout=30)
-                for update in updates:
-                    self._update_offset = update["update_id"] + 1
-                    await self._handle_update(update)
-            except Exception as exc:
-                print(f"[polling] {exc}", file=sys.stderr)
-                await asyncio.sleep(5)
 
-    async def _handle_update(self, update: dict) -> None:
-        message = update.get("message") or update.get("edited_message")
-        if not message:
-            return
-
-        chat = message.get("chat") or {}
-        chat_id = chat.get("id")
-        text = (message.get("text") or "").strip()
-        if not chat_id or not text:
-            return
-
-        command = text.split()[0].split("@")[0].lower()
-        if command == "/start":
-            await self._handle_start(chat_id)
-        elif command == "/weekly":
-            await self._handle_weekly(chat_id)
-
-    async def _handle_start(self, chat_id: int) -> None:
-        self.repository.add_chat(chat_id)
-        schedule_text = format_schedule(self.settings.schedule_day, self.settings.schedule_time)
-        await self.telegram_api.send_text(
-            chat_id,
-            "Чат зарегистрирован для еженедельной рассылки.\n"
-            f"Автоматическая отправка: {schedule_text}.\n"
-            "Команда /weekly запускает сборку сводки сразу.",
+def db_add_chat(chat_id: int) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO chats (chat_id, created_at)
+            VALUES (?, ?)
+            ON CONFLICT(chat_id) DO NOTHING
+            """,
+            (chat_id, datetime.utcnow().isoformat(timespec="seconds")),
         )
 
-    async def _handle_weekly(self, chat_id: int) -> None:
-        await self.telegram_api.send_text(chat_id, "Собираю свежую еженедельную сводку, это может занять пару минут.")
-        await self._send_digest_to_chat(chat_id)
 
-    async def _send_digest_to_chat(self, chat_id: int) -> None:
+def db_get_chat_ids() -> list[int]:
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute("SELECT chat_id FROM chats ORDER BY created_at ASC").fetchall()
+    return [int(row[0]) for row in rows]
+
+
+def db_get_cached_response(prompt_name: str, cache_date: str) -> str | None:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            """
+            SELECT response
+            FROM prompt_cache
+            WHERE prompt_name = ? AND cache_date = ?
+            """,
+            (prompt_name, cache_date),
+        ).fetchone()
+    if row is None:
+        return None
+    return str(row[0])
+
+
+def db_save_cached_response(prompt_name: str, cache_date: str, response: str) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO prompt_cache (prompt_name, cache_date, response, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(prompt_name, cache_date) DO UPDATE SET
+                response = excluded.response,
+                created_at = excluded.created_at
+            """,
+            (prompt_name, cache_date, response, datetime.utcnow().isoformat(timespec="seconds")),
+        )
+
+
+def tg_request(bot_token: str, method: str, payload: dict | None = None) -> dict:
+    url = TELEGRAM_API_URL.format(token=bot_token, method=method)
+    data = None
+    headers = {}
+    http_method = "GET"
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+        http_method = "POST"
+
+    req = request.Request(url, data=data, headers=headers, method=http_method)
+    try:
+        with request.urlopen(req, timeout=60) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except error.HTTPError as exc:
+        details = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Telegram API error {exc.code}: {details}") from exc
+    except error.URLError as exc:
+        raise RuntimeError(f"Telegram network error: {exc}") from exc
+
+    if not body.get("ok"):
+        raise RuntimeError(f"Telegram API returned error: {body}")
+    return body["result"]
+
+
+async def tg_get_updates(bot_token: str, offset: int | None, timeout: int = 30) -> list[dict]:
+    params = {"timeout": timeout}
+    if offset is not None:
+        params["offset"] = offset
+    query = parse.urlencode(params)
+    method = f"getUpdates?{query}"
+    return await asyncio.to_thread(tg_request, bot_token, method, None)
+
+
+async def tg_send_text(bot_token: str, chat_id: int, text: str) -> None:
+    for chunk in split_message(text):
+        payload = {"chat_id": chat_id, "text": chunk, "disable_web_page_preview": True}
+        await asyncio.to_thread(tg_request, bot_token, "sendMessage", payload)
+
+
+def openrouter_request(
+    api_key: str,
+    model: str,
+    search_type: str,
+    user_prompt: str,
+) -> str:
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        "web_search_options": {"search_type": search_type},
+    }
+    req = request.Request(
+        OPENROUTER_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/",
+            "X-Title": "weekly_agents_news",
+        },
+        method="POST",
+    )
+    try:
+        with request.urlopen(req, timeout=180) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except error.HTTPError as exc:
+        details = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenRouter API error {exc.code}: {details}") from exc
+    except error.URLError as exc:
+        raise RuntimeError(f"OpenRouter network error: {exc}") from exc
+
+    try:
+        return body["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError(f"Unexpected OpenRouter response: {body}") from exc
+
+
+async def generate_by_prompt(
+    api_key: str,
+    model: str,
+    search_type: str,
+    prompt_file: Path,
+    tz: timezone,
+) -> str:
+    prompt_name = prompt_file.stem.lower()
+    cache_date = datetime.now(tz).date().isoformat()
+    cached = db_get_cached_response(prompt_name, cache_date)
+    if cached is not None:
+        return f"{prompt_file.stem.upper()}\n\n{cached}"
+
+    prompt_text = read_prompt(prompt_file)
+    answer = await asyncio.to_thread(
+        openrouter_request,
+        api_key,
+        model,
+        search_type,
+        prompt_text,
+    )
+    db_save_cached_response(prompt_name, cache_date, answer)
+    return f"{prompt_file.stem.upper()}\n\n{answer}"
+
+
+def next_run_at(schedule_day: int, schedule_time: datetime.time, tz: timezone) -> datetime:
+    now = datetime.now(tz)
+    target = datetime.combine(now.date(), schedule_time, tzinfo=tz)
+    days_ahead = (schedule_day - now.weekday()) % 7
+    if days_ahead == 0 and target <= now:
+        days_ahead = 7
+    return target + timedelta(days=days_ahead)
+
+
+async def handle_start(bot_token: str, chat_id: int, commands: dict[str, Path]) -> None:
+    db_add_chat(chat_id)
+    cmd_text = ", ".join(sorted(commands.keys())) if commands else "(нет .txt в prompts)"
+    text = (
+        "Чат зарегистрирован для еженедельной рассылки.\n"
+        "Доступные команды по промптам:\n"
+        f"{cmd_text}"
+    )
+    await tg_send_text(bot_token, chat_id, text)
+
+
+async def handle_prompt_command(
+    bot_token: str,
+    chat_id: int,
+    command: str,
+    commands: dict[str, Path],
+    api_key: str,
+    model: str,
+    search_type: str,
+    tz: timezone,
+    request_lock: asyncio.Lock,
+) -> None:
+    prompt_file = commands.get(command)
+    if prompt_file is None:
+        return
+
+    await tg_send_text(bot_token, chat_id, f"Собираю сводку для команды {command}...")
+    try:
+        async with request_lock:
+            result = await generate_by_prompt(api_key, model, search_type, prompt_file, tz)
+        await tg_send_text(bot_token, chat_id, result)
+    except Exception as exc:
+        await tg_send_text(bot_token, chat_id, f"Ошибка при запросе {command}: {exc}")
+
+
+async def poll_loop(
+    bot_token: str,
+    commands: dict[str, Path],
+    api_key: str,
+    model: str,
+    search_type: str,
+    tz: timezone,
+    request_lock: asyncio.Lock,
+) -> None:
+    offset: int | None = None
+    while True:
         try:
-            digest = await self.digest_service.generate_digest()
-            await self.telegram_api.send_text(chat_id, digest)
+            updates = await tg_get_updates(bot_token, offset=offset, timeout=30)
+            for update in updates:
+                offset = update["update_id"] + 1
+                message = update.get("message") or update.get("edited_message")
+                if not message:
+                    continue
+                chat = message.get("chat") or {}
+                chat_id = chat.get("id")
+                text = (message.get("text") or "").strip()
+                if not chat_id or not text:
+                    continue
+
+                command = text.split()[0].split("@")[0].lower()
+                if command == "/start":
+                    await handle_start(bot_token, chat_id, commands)
+                elif command in commands:
+                    await handle_prompt_command(
+                        bot_token,
+                        chat_id,
+                        command,
+                        commands,
+                        api_key,
+                        model,
+                        search_type,
+                        tz,
+                        request_lock,
+                    )
         except Exception as exc:
-            await self.telegram_api.send_text(chat_id, f"Не удалось получить сводку: {exc}")
+            print(f"[polling] {exc}", file=sys.stderr)
+            await asyncio.sleep(5)
 
-    def _next_run_at(self) -> datetime:
-        now = datetime.now(self.settings.timezone)
-        target = datetime.combine(now.date(), self.settings.schedule_time, tzinfo=self.settings.timezone)
-        days_ahead = (self.settings.schedule_day - now.weekday()) % 7
-        if days_ahead == 0 and target <= now:
-            days_ahead = 7
-        return target + timedelta(days=days_ahead)
 
-    async def _weekly_scheduler_forever(self) -> None:
-        while True:
-            next_run = self._next_run_at()
-            delay = max((next_run - datetime.now(self.settings.timezone)).total_seconds(), 1)
-            print(f"[scheduler] Next run at {next_run.isoformat()}")
-            await asyncio.sleep(delay)
-            await self._broadcast_digest()
+async def weekly_broadcast_loop(
+    bot_token: str,
+    commands: dict[str, Path],
+    api_key: str,
+    model: str,
+    search_type: str,
+    schedule_day: int,
+    schedule_time: datetime.time,
+    tz: timezone,
+    request_lock: asyncio.Lock,
+) -> None:
+    while True:
+        run_at = next_run_at(schedule_day, schedule_time, tz)
+        delay = max((run_at - datetime.now(tz)).total_seconds(), 1)
+        print(f"[scheduler] Next run at {run_at.isoformat()}")
+        await asyncio.sleep(delay)
 
-    async def _broadcast_digest(self) -> None:
-        chat_ids = self.repository.get_all_chat_ids()
+        chat_ids = db_get_chat_ids()
         if not chat_ids:
             print("[scheduler] No registered chats yet")
-            return
+            continue
 
-        try:
-            digest = await self.digest_service.generate_digest()
-        except Exception as exc:
-            print(f"[scheduler] Failed to generate digest: {exc}", file=sys.stderr)
-            return
-
-        for chat_id in chat_ids:
+        for command, prompt_file in commands.items():
             try:
-                await self.telegram_api.send_text(chat_id, digest)
+                async with request_lock:
+                    result = await generate_by_prompt(api_key, model, search_type, prompt_file, tz)
             except Exception as exc:
-                print(f"[scheduler] Failed to send digest to {chat_id}: {exc}", file=sys.stderr)
+                print(f"[scheduler] Failed to generate for {command}: {exc}", file=sys.stderr)
+                continue
+
+            for chat_id in chat_ids:
+                try:
+                    await tg_send_text(bot_token, chat_id, result)
+                except Exception as exc:
+                    print(f"[scheduler] Failed to send to {chat_id}: {exc}", file=sys.stderr)
+
+
+def load_settings() -> dict:
+    env = load_env(ENV_PATH)
+    bot_token = env.get("BOT_TOKEN", "")
+    openrouter_api_key = env.get("OPENROUTER_API_KEY", "") or env.get("OPENROUTER_API_TOKEN", "")
+    if not bot_token or not openrouter_api_key:
+        raise RuntimeError("BOT_TOKEN and OPENROUTER_API_KEY must exist in .env")
+
+    model = env.get("OPENROUTER_MODEL", DEFAULT_MODEL)
+    search_type = env.get("OPENROUTER_SEARCH_TYPE", DEFAULT_SEARCH_TYPE)
+    schedule_day = int(env.get("WEEKLY_SEND_DAY", str(DEFAULT_DAY)))
+    schedule_time = datetime.strptime(env.get("WEEKLY_SEND_TIME", DEFAULT_TIME), "%H:%M").time()
+    tz = resolve_timezone(env.get("TZ", DEFAULT_TZ))
+
+    return {
+        "bot_token": bot_token,
+        "openrouter_api_key": openrouter_api_key,
+        "model": model,
+        "search_type": search_type,
+        "schedule_day": schedule_day,
+        "schedule_time": schedule_time,
+        "tz": tz,
+    }
 
 
 async def main() -> None:
-    settings = Settings.from_env()
-    repository = ChatRepository(DB_PATH)
-    telegram_api = TelegramBotAPI(settings.bot_token)
-    perplexity_client = PerplexityClient(settings.perplexity_api_token, settings.perplexity_model)
-    digest_service = WeeklyDigestService(PROMPTS_DIR, perplexity_client)
-    app = WeeklyBotApp(settings, repository, telegram_api, digest_service)
-    await app.run()
+    settings = load_settings()
+    commands = get_prompt_commands()
+    if not commands:
+        raise RuntimeError("No .txt prompts found in prompts/")
+
+    db_init()
+    request_lock = asyncio.Lock()
+
+    print(f"[startup] Prompt commands: {', '.join(sorted(commands.keys()))}")
+    await asyncio.gather(
+        poll_loop(
+            settings["bot_token"],
+            commands,
+            settings["openrouter_api_key"],
+            settings["model"],
+            settings["search_type"],
+            settings["tz"],
+            request_lock,
+        ),
+        weekly_broadcast_loop(
+            settings["bot_token"],
+            commands,
+            settings["openrouter_api_key"],
+            settings["model"],
+            settings["search_type"],
+            settings["schedule_day"],
+            settings["schedule_time"],
+            settings["tz"],
+            request_lock,
+        ),
+    )
 
 
 if __name__ == "__main__":
