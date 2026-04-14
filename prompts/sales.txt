@@ -1,10 +1,11 @@
 Подготовь обзор правового регулирования (изменения законодательства; проекты нормативных актов; разъяснения государственных органов; судебная практика; обзоры и legal alerts юридических фирм; аналитические комментарии) на русском языке в следующий сферах:
-а) обязательственное право по вопросам поставки товаров;
-б) внешнеэкономическая деятельность по продаже товаров;
-в) техническое регулирование в сфере нефтехимической продукции и продукции, производимой из нефтехимической продукции;
-г) ответственность производителя за качество товаров.
+а) обязательственное право по вопросам поставки товаров; 
+б) внешнеэкономическая деятельность по продаже товаров; 
+в) техническое регулирование в сфере нефтехимической продукции и продукции, производимой из нефтехимической продукции; 
+г) ответственность производителя за качество товаров. 
 Формат обзора: 1) категория; 2) краткий заголовок, 3) краткое содержание, 4) анализ влияния на бизнес, 5) ссылка на источник.
 Правила отбора материалов:
 а) Включай только релевантные публикации;
 б) Если один инфоповод встречается в нескольких источниках — выбирай наиболее содержательный.
-в) Не включай старые материалы, утратившие актуальность. Источники: http://pravo.gov.ru, https://www.consultant.ru/legalnews/, https://www.garant.ru/news/, http://kremlin.ru, http://government.ru, http://www.duma.gov.ru, http://council.gov.ru, http://ksrf.ru, https://vsrf.ru, http://regulation.gov.ru, http://www.minjust.ru, https://m-logos.ru, https://zakon.ru, https://pravo.ru, https://www.garant.ru, https://lawfirm.ru, https://boosty.to/bevzenko, https://www.pgplaw.ru, https://epam.ru, https://www.tedo.ru, https://www.maximalegal.ru, https://www.kiap.com, https://www.alrud.ru, https://alumnipartners.ru, https://denuo.legal/ru/insights/news/, https://nextons.ru/news/, https://kept.ru/news/, https://t.me/sercons, https://t.me/rgtr_ru, https://t.me/shortreadlaw, https://t.me/m_tserkovnikov, https://t.me/betterchance_ru, https://t.me/verbalegal, https://www.consultant.ru/legalnews/, https://t.me/denuolaw, https://t.me/tedo_business, https://t.me/kept_business, https://t.me/pgp_official, https://t.me/alumnipartnerslawfirm.
+в) Не включай старые материалы, утратившие актуальность.
+Источники: http://pravo.gov.ru, https://www.consultant.ru/legalnews/, https://www.garant.ru/news/, http://kremlin.ru, http://government.ru, http://www.duma.gov.ru, http://council.gov.ru, http://ksrf.ru, https://vsrf.ru, http://regulation.gov.ru, http://www.minjust.ru, https://m-logos.ru, https://zakon.ru, https://pravo.ru, https://www.garant.ru, https://lawfirm.ru, https://boosty.to/bevzenko, https://www.pgplaw.ru, https://epam.ru, https://www.tedo.ru, https://www.maximalegal.ru, https://www.kiap.com, https://www.alrud.ru, https://alumnipartners.ru, https://denuo.legal/ru/insights/news/, https://nextons.ru/news/, https://kept.ru/news/, https://t.me/sercons, https://t.me/rgtr_ru, https://t.me/shortreadlaw, https://t.me/m_tserkovnikov, https://t.me/betterchance_ru, https://t.me/verbalegal, https://www.consultant.ru/legalnews/, https://t.me/denuolaw, https://t.me/tedo_business, https://t.me/kept_business, https://t.me/pgp_official, https://t.me/alumnipartnerslawfirm.

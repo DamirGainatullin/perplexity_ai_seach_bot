@@ -14,8 +14,7 @@ DB_PATH = BASE_DIR / "weekly_bot.sqlite3"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/{method}"
 MAX_TELEGRAM_MESSAGE_LENGTH = 4000
-DEFAULT_MODEL = "perplexity/sonar-pro"
-DEFAULT_SEARCH_TYPE = "auto"
+DEFAULT_MODEL = "perplexity/sonar-pro-search"
 DEFAULT_DAY = 0
 DEFAULT_TIME = "09:00"
 DEFAULT_TZ = "Europe/Moscow"
@@ -234,7 +233,6 @@ async def tg_send_text(bot_token: str, chat_id: int, text: str) -> None:
 def openrouter_request(
     api_key: str,
     model: str,
-    search_type: str,
     user_prompt: str,
 ) -> str:
     payload = {
@@ -243,7 +241,6 @@ def openrouter_request(
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ],
-        "web_search_options": {"search_type": search_type},
     }
     req = request.Request(
         OPENROUTER_URL,
@@ -259,22 +256,19 @@ def openrouter_request(
     try:
         with request.urlopen(req, timeout=180) as resp:
             body = json.loads(resp.read().decode("utf-8"))
+            return body["choices"][0]["message"]["content"].strip()
     except error.HTTPError as exc:
         details = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"OpenRouter API error {exc.code}: {details}") from exc
     except error.URLError as exc:
         raise RuntimeError(f"OpenRouter network error: {exc}") from exc
-
-    try:
-        return body["choices"][0]["message"]["content"].strip()
     except (KeyError, IndexError, TypeError) as exc:
-        raise RuntimeError(f"Unexpected OpenRouter response: {body}") from exc
+        raise RuntimeError("Unexpected OpenRouter response format") from exc
 
 
 async def generate_by_prompt(
     api_key: str,
     model: str,
-    search_type: str,
     prompt_file: Path,
     tz: timezone,
 ) -> str:
@@ -289,7 +283,6 @@ async def generate_by_prompt(
         openrouter_request,
         api_key,
         model,
-        search_type,
         prompt_text,
     )
     db_save_cached_response(prompt_name, cache_date, answer)
@@ -323,7 +316,6 @@ async def handle_prompt_command(
     commands: dict[str, Path],
     api_key: str,
     model: str,
-    search_type: str,
     tz: timezone,
     request_lock: asyncio.Lock,
 ) -> None:
@@ -334,7 +326,12 @@ async def handle_prompt_command(
     await tg_send_text(bot_token, chat_id, f"Собираю сводку для команды {command}...")
     try:
         async with request_lock:
-            result = await generate_by_prompt(api_key, model, search_type, prompt_file, tz)
+            result = await generate_by_prompt(
+                api_key,
+                model,
+                prompt_file,
+                tz,
+            )
         await tg_send_text(bot_token, chat_id, result)
     except Exception as exc:
         await tg_send_text(bot_token, chat_id, f"Ошибка при запросе {command}: {exc}")
@@ -345,7 +342,6 @@ async def poll_loop(
     commands: dict[str, Path],
     api_key: str,
     model: str,
-    search_type: str,
     tz: timezone,
     request_lock: asyncio.Lock,
 ) -> None:
@@ -375,7 +371,6 @@ async def poll_loop(
                         commands,
                         api_key,
                         model,
-                        search_type,
                         tz,
                         request_lock,
                     )
@@ -389,7 +384,6 @@ async def weekly_broadcast_loop(
     commands: dict[str, Path],
     api_key: str,
     model: str,
-    search_type: str,
     schedule_day: int,
     schedule_time: datetime.time,
     tz: timezone,
@@ -409,7 +403,12 @@ async def weekly_broadcast_loop(
         for command, prompt_file in commands.items():
             try:
                 async with request_lock:
-                    result = await generate_by_prompt(api_key, model, search_type, prompt_file, tz)
+                    result = await generate_by_prompt(
+                        api_key,
+                        model,
+                        prompt_file,
+                        tz,
+                    )
             except Exception as exc:
                 print(f"[scheduler] Failed to generate for {command}: {exc}", file=sys.stderr)
                 continue
@@ -424,12 +423,15 @@ async def weekly_broadcast_loop(
 def load_settings() -> dict:
     env = load_env(ENV_PATH)
     bot_token = env.get("BOT_TOKEN", "")
-    openrouter_api_key = env.get("OPENROUTER_API_KEY", "") or env.get("OPENROUTER_API_TOKEN", "")
+    openrouter_api_key = (
+        env.get("OPENROUTER_API_KEY", "")
+        or env.get("OPENROUTER_API_TOKEN", "")
+        or env.get("PERPLEXITY_API_TOKEN", "")
+    )
     if not bot_token or not openrouter_api_key:
         raise RuntimeError("BOT_TOKEN and OPENROUTER_API_KEY must exist in .env")
 
     model = env.get("OPENROUTER_MODEL", DEFAULT_MODEL)
-    search_type = env.get("OPENROUTER_SEARCH_TYPE", DEFAULT_SEARCH_TYPE)
     schedule_day = int(env.get("WEEKLY_SEND_DAY", str(DEFAULT_DAY)))
     schedule_time = datetime.strptime(env.get("WEEKLY_SEND_TIME", DEFAULT_TIME), "%H:%M").time()
     tz = resolve_timezone(env.get("TZ", DEFAULT_TZ))
@@ -438,7 +440,6 @@ def load_settings() -> dict:
         "bot_token": bot_token,
         "openrouter_api_key": openrouter_api_key,
         "model": model,
-        "search_type": search_type,
         "schedule_day": schedule_day,
         "schedule_time": schedule_time,
         "tz": tz,
@@ -461,7 +462,6 @@ async def main() -> None:
             commands,
             settings["openrouter_api_key"],
             settings["model"],
-            settings["search_type"],
             settings["tz"],
             request_lock,
         ),
@@ -470,7 +470,6 @@ async def main() -> None:
             commands,
             settings["openrouter_api_key"],
             settings["model"],
-            settings["search_type"],
             settings["schedule_day"],
             settings["schedule_time"],
             settings["tz"],
