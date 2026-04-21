@@ -15,9 +15,9 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/{method}"
 MAX_TELEGRAM_MESSAGE_LENGTH = 4000
 DEFAULT_MODEL = "perplexity/sonar-pro-search"
-DEFAULT_DAY = 0
-DEFAULT_TIME = "09:00"
 DEFAULT_TZ = "Europe/Moscow"
+SEARCH_RECENCY_FILTER = "week"
+WEB_SEARCH_PLUGIN = [{"id": "web"}]
 SYSTEM_PROMPT = (
     "Ты готовишь аккуратную еженедельную новостную сводку на русском языке. "
     "Пиши в plain text без Markdown: не используй символы **, заголовки с ## и нумерованные ссылки вида [1], [2]. "
@@ -241,6 +241,8 @@ def openrouter_request(
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ],
+        "plugins": WEB_SEARCH_PLUGIN,
+        "search_recency_filter": SEARCH_RECENCY_FILTER,
     }
     req = request.Request(
         OPENROUTER_URL,
@@ -287,15 +289,6 @@ async def generate_by_prompt(
     )
     db_save_cached_response(prompt_name, cache_date, answer)
     return f"{prompt_file.stem.upper()}\n\n{answer}"
-
-
-def next_run_at(schedule_day: int, schedule_time: datetime.time, tz: timezone) -> datetime:
-    now = datetime.now(tz)
-    target = datetime.combine(now.date(), schedule_time, tzinfo=tz)
-    days_ahead = (schedule_day - now.weekday()) % 7
-    if days_ahead == 0 and target <= now:
-        days_ahead = 7
-    return target + timedelta(days=days_ahead)
 
 
 async def handle_start(bot_token: str, chat_id: int, commands: dict[str, Path]) -> None:
@@ -379,47 +372,6 @@ async def poll_loop(
             await asyncio.sleep(5)
 
 
-async def weekly_broadcast_loop(
-    bot_token: str,
-    commands: dict[str, Path],
-    api_key: str,
-    model: str,
-    schedule_day: int,
-    schedule_time: datetime.time,
-    tz: timezone,
-    request_lock: asyncio.Lock,
-) -> None:
-    while True:
-        run_at = next_run_at(schedule_day, schedule_time, tz)
-        delay = max((run_at - datetime.now(tz)).total_seconds(), 1)
-        print(f"[scheduler] Next run at {run_at.isoformat()}")
-        await asyncio.sleep(delay)
-
-        chat_ids = db_get_chat_ids()
-        if not chat_ids:
-            print("[scheduler] No registered chats yet")
-            continue
-
-        for command, prompt_file in commands.items():
-            try:
-                async with request_lock:
-                    result = await generate_by_prompt(
-                        api_key,
-                        model,
-                        prompt_file,
-                        tz,
-                    )
-            except Exception as exc:
-                print(f"[scheduler] Failed to generate for {command}: {exc}", file=sys.stderr)
-                continue
-
-            for chat_id in chat_ids:
-                try:
-                    await tg_send_text(bot_token, chat_id, result)
-                except Exception as exc:
-                    print(f"[scheduler] Failed to send to {chat_id}: {exc}", file=sys.stderr)
-
-
 def load_settings() -> dict:
     env = load_env(ENV_PATH)
     bot_token = env.get("BOT_TOKEN", "")
@@ -432,16 +384,12 @@ def load_settings() -> dict:
         raise RuntimeError("BOT_TOKEN and OPENROUTER_API_KEY must exist in .env")
 
     model = env.get("OPENROUTER_MODEL", DEFAULT_MODEL)
-    schedule_day = int(env.get("WEEKLY_SEND_DAY", str(DEFAULT_DAY)))
-    schedule_time = datetime.strptime(env.get("WEEKLY_SEND_TIME", DEFAULT_TIME), "%H:%M").time()
     tz = resolve_timezone(env.get("TZ", DEFAULT_TZ))
 
     return {
         "bot_token": bot_token,
         "openrouter_api_key": openrouter_api_key,
         "model": model,
-        "schedule_day": schedule_day,
-        "schedule_time": schedule_time,
         "tz": tz,
     }
 
@@ -456,25 +404,13 @@ async def main() -> None:
     request_lock = asyncio.Lock()
 
     print(f"[startup] Prompt commands: {', '.join(sorted(commands.keys()))}")
-    await asyncio.gather(
-        poll_loop(
-            settings["bot_token"],
-            commands,
-            settings["openrouter_api_key"],
-            settings["model"],
-            settings["tz"],
-            request_lock,
-        ),
-        weekly_broadcast_loop(
-            settings["bot_token"],
-            commands,
-            settings["openrouter_api_key"],
-            settings["model"],
-            settings["schedule_day"],
-            settings["schedule_time"],
-            settings["tz"],
-            request_lock,
-        ),
+    await poll_loop(
+        settings["bot_token"],
+        commands,
+        settings["openrouter_api_key"],
+        settings["model"],
+        settings["tz"],
+        request_lock,
     )
 
 
