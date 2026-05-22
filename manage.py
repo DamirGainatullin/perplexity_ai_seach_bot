@@ -7,8 +7,18 @@ from typing import Any, Optional
 from core.db import db_add_chat, db_get_cached_response, db_init, db_save_cached_response
 from core.env import load_env, read_text_with_fallback, resolve_timezone
 from core.telegram_api import tg_get_updates, tg_send_text
+from pipelines.adaptive_followup import (
+    DEFAULT_FOLLOWUP_CREDIT_CAP,
+    DEFAULT_FOLLOWUP_MAX_QUERIES,
+    DEFAULT_FOLLOWUP_MAX_RESULTS,
+    merge_digest_rows,
+    plan_followup_queries,
+    run_followup_queries,
+)
 from pipelines.engine import format_digest_response, run_budget_pipeline
 from pipelines.models import PromptProfile
+from pipelines.openrouter_filter import DEFAULT_OPENROUTER_MODEL, filter_digest_rows_with_openrouter
+from pipelines.perplexity_seed import load_latest_perplexity_summary_for_profile
 from pipelines.profiles import load_profiles
 
 
@@ -19,17 +29,48 @@ DB_PATH = BASE_DIR / "weekly_bot.sqlite3"
 DEFAULT_TZ = "Europe/Moscow"
 
 
+def _safe_bool(raw: str | None, default: bool) -> bool:
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _safe_int(raw: str | None, default: int) -> int:
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _safe_float(raw: str | None, default: float) -> float:
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 def get_prompt_commands(profiles: dict[str, PromptProfile]) -> dict[str, Path]:
     return {command: profile.prompt_path for command, profile in profiles.items()}
 
 
 async def generate_by_profile(
     tavily_api_key: str,
+    openrouter_api_key: str,
+    openrouter_model: str,
+    adaptive_followup_enabled: bool,
+    followup_credit_cap: float,
+    followup_max_queries: int,
+    followup_max_results: int,
     profile: PromptProfile,
     tz,
 ) -> str:
     prompt_name = profile.name
-    cache_date = datetime.now(tz).date().isoformat()
+    now_date = datetime.now(tz).date()
+    cache_date = now_date.isoformat()
     cached = db_get_cached_response(DB_PATH, prompt_name, cache_date)
     if cached is not None:
         return cached
@@ -40,8 +81,54 @@ async def generate_by_profile(
         profile,
         prompt_text,
         tavily_api_key,
-        datetime.now(tz).date(),
+        now_date,
     )
+
+    if adaptive_followup_enabled:
+        seed_summary, seed_meta = await asyncio.to_thread(
+            load_latest_perplexity_summary_for_profile,
+            profile.name,
+            PROMPTS_DIR,
+            BASE_DIR,
+        )
+        usage.update(seed_meta)
+
+        queries, plan_meta = await asyncio.to_thread(
+            plan_followup_queries,
+            prompt_text,
+            seed_summary,
+            rows,
+            openrouter_api_key,
+            openrouter_model,
+            max(1, followup_max_queries),
+        )
+        usage.update(plan_meta)
+
+        extra_rows, followup_meta = await asyncio.to_thread(
+            run_followup_queries,
+            profile,
+            tavily_api_key,
+            now_date,
+            queries,
+            max(0.0, followup_credit_cap),
+            max(1, followup_max_results),
+        )
+        usage.update(followup_meta)
+        usage["total_credits"] = float(usage.get("total_credits", 0.0)) + float(
+            followup_meta.get("followup_search_credits", 0.0)
+        )
+        if extra_rows:
+            rows = merge_digest_rows(rows, extra_rows, limit=15)
+        usage["followup_rows_after_merge"] = len(rows)
+
+    rows, filter_usage = await asyncio.to_thread(
+        filter_digest_rows_with_openrouter,
+        rows,
+        prompt_text,
+        openrouter_api_key,
+        openrouter_model,
+    )
+    usage.update(filter_usage)
     response_text = format_digest_response(profile, rows, usage)
     db_save_cached_response(DB_PATH, prompt_name, cache_date, response_text)
     return response_text
@@ -64,6 +151,12 @@ async def handle_prompt_command(
     command: str,
     profiles: dict[str, PromptProfile],
     tavily_api_key: str,
+    openrouter_api_key: str,
+    openrouter_model: str,
+    adaptive_followup_enabled: bool,
+    followup_credit_cap: float,
+    followup_max_queries: int,
+    followup_max_results: int,
     tz,
     request_lock: asyncio.Lock,
 ) -> None:
@@ -74,7 +167,17 @@ async def handle_prompt_command(
     await tg_send_text(bot_token, chat_id, f"Собираю сводку для команды {command}...")
     try:
         async with request_lock:
-            result = await generate_by_profile(tavily_api_key, profile, tz)
+            result = await generate_by_profile(
+                tavily_api_key,
+                openrouter_api_key,
+                openrouter_model,
+                adaptive_followup_enabled,
+                followup_credit_cap,
+                followup_max_queries,
+                followup_max_results,
+                profile,
+                tz,
+            )
         await tg_send_text(bot_token, chat_id, result)
     except Exception as exc:
         await tg_send_text(bot_token, chat_id, f"Ошибка при запросе {command}: {exc}")
@@ -84,6 +187,12 @@ async def poll_loop(
     bot_token: str,
     profiles: dict[str, PromptProfile],
     tavily_api_key: str,
+    openrouter_api_key: str,
+    openrouter_model: str,
+    adaptive_followup_enabled: bool,
+    followup_credit_cap: float,
+    followup_max_queries: int,
+    followup_max_results: int,
     tz,
     request_lock: asyncio.Lock,
 ) -> None:
@@ -112,6 +221,12 @@ async def poll_loop(
                         command,
                         profiles,
                         tavily_api_key,
+                        openrouter_api_key,
+                        openrouter_model,
+                        adaptive_followup_enabled,
+                        followup_credit_cap,
+                        followup_max_queries,
+                        followup_max_results,
                         tz,
                         request_lock,
                     )
@@ -126,11 +241,23 @@ def load_settings() -> dict[str, Any]:
     tavily_api_key = env.get("TAVILY_API_KEY", "")
     if not bot_token or not tavily_api_key:
         raise RuntimeError("BOT_TOKEN and TAVILY_API_KEY must exist in .env")
+    openrouter_api_key = env.get("OPENROUTER_API_KEY", "").strip()
+    openrouter_model = env.get("OPENROUTER_MODEL", DEFAULT_OPENROUTER_MODEL).strip() or DEFAULT_OPENROUTER_MODEL
+    adaptive_followup_enabled = _safe_bool(env.get("ADAPTIVE_FOLLOWUP_ENABLED"), True)
+    followup_credit_cap = max(0.0, _safe_float(env.get("FOLLOWUP_CREDIT_CAP"), DEFAULT_FOLLOWUP_CREDIT_CAP))
+    followup_max_queries = max(1, _safe_int(env.get("FOLLOWUP_MAX_QUERIES"), DEFAULT_FOLLOWUP_MAX_QUERIES))
+    followup_max_results = max(1, _safe_int(env.get("FOLLOWUP_MAX_RESULTS"), DEFAULT_FOLLOWUP_MAX_RESULTS))
 
     tz = resolve_timezone(env.get("TZ", DEFAULT_TZ))
     return {
         "bot_token": bot_token,
         "tavily_api_key": tavily_api_key,
+        "openrouter_api_key": openrouter_api_key,
+        "openrouter_model": openrouter_model,
+        "adaptive_followup_enabled": adaptive_followup_enabled,
+        "followup_credit_cap": followup_credit_cap,
+        "followup_max_queries": followup_max_queries,
+        "followup_max_results": followup_max_results,
         "tz": tz,
     }
 
@@ -145,10 +272,27 @@ async def main() -> None:
     request_lock = asyncio.Lock()
 
     print(f"[startup] Prompt commands: {', '.join(sorted(profiles.keys()))}")
+    print(
+        "[startup] OpenRouter filter: "
+        + ("enabled" if settings["openrouter_api_key"] else "disabled (OPENROUTER_API_KEY missing)")
+    )
+    print(
+        "[startup] Adaptive follow-up: "
+        f"{'enabled' if settings['adaptive_followup_enabled'] else 'disabled'}, "
+        f"credit_cap={settings['followup_credit_cap']}, "
+        f"max_queries={settings['followup_max_queries']}, "
+        f"max_results={settings['followup_max_results']}"
+    )
     await poll_loop(
         settings["bot_token"],
         profiles,
         settings["tavily_api_key"],
+        settings["openrouter_api_key"],
+        settings["openrouter_model"],
+        settings["adaptive_followup_enabled"],
+        settings["followup_credit_cap"],
+        settings["followup_max_queries"],
+        settings["followup_max_results"],
         settings["tz"],
         request_lock,
     )

@@ -21,6 +21,7 @@ from pipelines.helpers import (
     short_query,
 )
 from pipelines.models import PromptProfile, QueryRule
+from pipelines.telegram_feed import extract_telegram_channels, parse_recent_open_channel_posts
 
 
 @dataclass
@@ -28,6 +29,15 @@ class SearchRun:
     rule: QueryRule
     include_domains: list[str]
     response: dict[str, Any]
+
+
+def _build_telegram_title(channel: str, text: str, post_id: int) -> str:
+    preview = " ".join((text or "").split())
+    if not preview:
+        return f"Telegram @{channel} post {post_id}"
+    if len(preview) <= 90:
+        return f"Telegram @{channel}: {preview}"
+    return f"Telegram @{channel}: {preview[:87]}..."
 
 
 def _search_with_retry(client: TavilyClient, payload: dict[str, Any]) -> dict[str, Any]:
@@ -186,6 +196,41 @@ def run_budget_pipeline(
         reverse=True,
     )
 
+    # Stage 5b: fetch recent posts from open Telegram channels found in prompt sources.
+    telegram_channels = extract_telegram_channels(include_domains)
+    telegram_items: list[dict[str, Any]] = []
+    telegram_errors: list[str] = []
+    existing_urls = {str(item.get("url", "")).strip() for item in strict_items if item.get("url")}
+    for channel in telegram_channels:
+        posts, error = parse_recent_open_channel_posts(
+            channel,
+            start_date=start_d,
+            end_date=end_d,
+            max_posts=8,
+        )
+        if error:
+            telegram_errors.append(f"{channel}: {error}")
+            continue
+        for post in posts:
+            if post.url in existing_urls:
+                continue
+            existing_urls.add(post.url)
+            telegram_items.append(
+                {
+                    "title": _build_telegram_title(post.channel, post.text, post.post_id),
+                    "content": post.text,
+                    "url": post.url,
+                    "strict_effective_date": post.published_iso,
+                    "quality_score": 0.5,
+                }
+            )
+
+    strict_items.extend(telegram_items)
+    strict_items.sort(
+        key=lambda x: (x.get("strict_effective_date", ""), float(x.get("quality_score", 0.0))),
+        reverse=True,
+    )
+
     # Stage 6: build final digest rows in standard output format.
     digest_rows: list[dict[str, str]] = []
     for item in strict_items[:15]:
@@ -211,6 +256,10 @@ def run_budget_pipeline(
         "start_date": start_date,
         "end_date": end_date,
         "strict_items_count": len(strict_items),
+        "telegram_channels_total": len(telegram_channels),
+        "telegram_channels_ok": len(telegram_channels) - len(telegram_errors),
+        "telegram_errors_count": len(telegram_errors),
+        "telegram_posts_added": len(telegram_items),
     }
     return digest_rows, usage
 
@@ -237,5 +286,29 @@ def format_digest_response(profile: PromptProfile, rows: list[dict[str, str]], u
         f"(search={usage['search_credits']:.1f}, extract={usage['extract_credits']:.1f}), "
         f"target<={usage['target_credits']}"
     )
+    lines.append(
+        "Telegram sources: "
+        f"channels={usage.get('telegram_channels_total', 0)}, "
+        f"ok={usage.get('telegram_channels_ok', 0)}, "
+        f"posts_added={usage.get('telegram_posts_added', 0)}, "
+        f"errors={usage.get('telegram_errors_count', 0)}"
+    )
+    if "followup_plan_status" in usage or "followup_search_status" in usage:
+        lines.append(
+            "Adaptive follow-up: "
+            f"seed={usage.get('perplexity_seed_status', 'n/a')}, "
+            f"plan={usage.get('followup_plan_status', 'n/a')}, "
+            f"queries={usage.get('followup_plan_queries_count', 0)}, "
+            f"runs={usage.get('followup_search_runs_executed', 0)}, "
+            f"rows_added={usage.get('followup_search_rows_added', 0)}, "
+            f"credits={float(usage.get('followup_search_credits', 0.0)):.1f}"
+        )
+    if "openrouter_filter_status" in usage:
+        lines.append(
+            "OpenRouter filter: "
+            f"status={usage.get('openrouter_filter_status')}, "
+            f"input={usage.get('openrouter_filter_input_items', 0)}, "
+            f"output={usage.get('openrouter_filter_output_items', 0)}, "
+            f"removed={usage.get('openrouter_filter_removed_items', 0)}"
+        )
     return "\n".join(lines).strip()
-

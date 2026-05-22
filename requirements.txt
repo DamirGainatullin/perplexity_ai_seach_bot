@@ -1,2 +1,5 @@
 tavily-python==0.7.24
 requests==2.32.4
+google-api-python-client==2.184.0
+google-auth-httplib2==0.2.0
+google-auth-oauthlib==1.2.2
