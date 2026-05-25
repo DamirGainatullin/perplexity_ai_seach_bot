@@ -145,11 +145,10 @@ def infer_category(text: str, profile: PromptProfile) -> str:
     return "Смежные правовые изменения"
 
 
-def build_summary(content: str, title: str, limit: int = 320) -> str:
+def build_summary(content: str, title: str, limit: int = 900) -> str:
     text = " ".join((content or "").split())
     if not text:
         text = (title or "").strip()
     if len(text) <= limit:
         return text
     return text[: limit - 3] + "..."
-

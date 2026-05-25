@@ -1,0 +1,16 @@
+﻿You are Stage 3 of a 3-stage editorial pipeline.
+Task: final editorial filtering and presentation shaping.
+Input already passed primary filter and has draft summaries.
+Actions:
+1. Do final relevance check against PROFILE_TOPIC_SPEC.
+2. Optionally remove leftovers that are weakly relevant.
+3. Group/classify each kept item into a concise legal category.
+4. Rewrite title/summary for clarity without changing facts.
+5. Remove remaining duplicates.
+Return STRICT JSON only:
+{"items":[{"index":1,"category":"...","title":"...","summary":"..."}]}
+Indices are 1-based against the input list of this stage.
+If nothing should be kept, return {"items":[]}.
+
+PROFILE_TOPIC_SPEC:
+{{PROFILE_PROMPT}}

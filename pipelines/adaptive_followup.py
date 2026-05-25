@@ -172,6 +172,7 @@ def plan_followup_queries(
         "followup_plan_status": "ok",
         "followup_plan_model": model or DEFAULT_OPENROUTER_MODEL,
         "followup_plan_queries_count": len(queries),
+        "followup_plan_queries": queries,
         "followup_plan_prompt_tokens": (usage or {}).get("prompt_tokens", 0),
         "followup_plan_completion_tokens": (usage or {}).get("completion_tokens", 0),
     }
@@ -197,7 +198,7 @@ def run_followup_queries(
     max_results_per_query: int = DEFAULT_FOLLOWUP_MAX_RESULTS,
 ) -> tuple[list[dict[str, str]], dict[str, Any]]:
     if not queries:
-        return [], {"followup_search_status": "skipped_no_queries"}
+        return [], {"followup_search_status": "skipped_no_queries", "followup_search_runs_debug": []}
 
     start_date = (now_date - timedelta(days=7)).isoformat()
     end_date = now_date.isoformat()
@@ -209,10 +210,20 @@ def run_followup_queries(
     runs_executed = 0
     errors: list[str] = []
     merged_by_url: dict[str, dict[str, Any]] = {}
+    runs_debug: list[dict[str, Any]] = []
 
     for query in queries:
         # Advanced search typically costs 2 credits. Keep a hard margin by cap.
         if search_credits + 2.0 > float(credit_cap) + 1e-9:
+            runs_debug.append(
+                {
+                    "query": short_query(query),
+                    "status": "skipped_budget_cap",
+                    "credits": 0.0,
+                    "results_count": 0,
+                    "top_results": [],
+                }
+            )
             break
 
         payload = {
@@ -230,11 +241,40 @@ def run_followup_queries(
             response = _search_with_retry(client, payload)
         except Exception as exc:
             errors.append(f"{query[:120]}: {exc}")
+            runs_debug.append(
+                {
+                    "query": short_query(query),
+                    "status": "error",
+                    "error": str(exc),
+                    "credits": 0.0,
+                    "results_count": 0,
+                    "top_results": [],
+                }
+            )
             continue
 
         runs_executed += 1
-        search_credits += float((response.get("usage") or {}).get("credits", 0))
-        for item in response.get("results", []) or []:
+        run_credits = float((response.get("usage") or {}).get("credits", 0))
+        search_credits += run_credits
+        run_results = response.get("results", []) or []
+        runs_debug.append(
+            {
+                "query": short_query(query),
+                "status": "ok",
+                "credits": run_credits,
+                "results_count": len(run_results),
+                "top_results": [
+                    {
+                        "title": str(x.get("title", "")),
+                        "url": str(x.get("url", "")),
+                        "published_date": str(x.get("published_date", "")),
+                        "score": float(x.get("score", 0.0) or 0.0),
+                    }
+                    for x in run_results[:5]
+                ],
+            }
+        )
+        for item in run_results:
             url = item.get("url") or ""
             if not url:
                 continue
@@ -291,6 +331,7 @@ def run_followup_queries(
             "category": infer_category(f"{item.get('title', '')} {item.get('content', '')}", profile),
             "title": str(item.get("title", "(без заголовка)")).strip() or "(без заголовка)",
             "summary": build_summary(str(item.get("content", "")), str(item.get("title", ""))),
+            "content": str(item.get("content", "")).strip(),
             "url": str(item.get("url", "")).strip(),
             "date": str(item.get("date", "")).strip(),
         }
@@ -305,6 +346,8 @@ def run_followup_queries(
         "followup_search_credits": search_credits,
         "followup_search_credit_cap": float(credit_cap),
         "followup_search_errors_count": len(errors),
+        "followup_search_errors": errors[:20],
+        "followup_search_runs_debug": runs_debug,
     }
 
 

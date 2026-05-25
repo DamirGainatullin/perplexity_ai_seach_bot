@@ -80,14 +80,16 @@ def run_budget_pipeline(
     plan = profile.query_plan[: profile.budget.search_run_limit]
     runs: list[SearchRun] = []
     search_credits = 0.0
+    search_run_details: list[dict[str, Any]] = []
 
     # Stage 2: run limited Tavily search calls according to prompt profile query plan.
     for rule in plan:
         scoped_domains = resolve_domain_scope(rule.domain_scope, groups)
+        query_text = short_query(rule.query)
         response = _search_with_retry(
             client,
             {
-                "query": short_query(rule.query),
+                "query": query_text,
                 "topic": rule.topic,
                 "search_depth": "advanced",
                 "start_date": start_date,
@@ -98,7 +100,30 @@ def run_budget_pipeline(
                 "max_results": profile.budget.max_results,
             },
         )
-        search_credits += float((response.get("usage") or {}).get("credits", 0))
+        run_credits = float((response.get("usage") or {}).get("credits", 0))
+        search_credits += run_credits
+        run_results = response.get("results", []) or []
+        search_run_details.append(
+            {
+                "strategy": rule.strategy,
+                "topic": rule.topic,
+                "domain_scope": rule.domain_scope,
+                "query": query_text,
+                "include_domains_count": len(scoped_domains),
+                "include_domains": scoped_domains,
+                "credits": run_credits,
+                "results_count": len(run_results),
+                "top_results": [
+                    {
+                        "title": str(x.get("title", "")),
+                        "url": str(x.get("url", "")),
+                        "published_date": str(x.get("published_date", "")),
+                        "score": float(x.get("score", 0.0) or 0.0),
+                    }
+                    for x in run_results[:5]
+                ],
+            }
+        )
         runs.append(SearchRun(rule=rule, include_domains=scoped_domains, response=response))
 
     # Stage 3: merge results by URL and keep best-scored candidate.
@@ -240,6 +265,7 @@ def run_budget_pipeline(
                 "category": infer_category(text_for_category, profile),
                 "title": str(item.get("title", "(без заголовка)")).strip() or "(без заголовка)",
                 "summary": build_summary(str(item.get("content", "")), str(item.get("title", ""))),
+                "content": str(item.get("content", "")).strip(),
                 "url": str(item.get("url", "")).strip(),
                 "date": str(item.get("strict_effective_date", "")).strip(),
             }
@@ -260,6 +286,18 @@ def run_budget_pipeline(
         "telegram_channels_ok": len(telegram_channels) - len(telegram_errors),
         "telegram_errors_count": len(telegram_errors),
         "telegram_posts_added": len(telegram_items),
+        "search_run_details": search_run_details,
+        "extract_urls_requested": extract_subset,
+        "extract_urls_extracted": len(extracted_by_url),
+        "strict_top_items_debug": [
+            {
+                "title": str(x.get("title", "")),
+                "url": str(x.get("url", "")),
+                "date": str(x.get("strict_effective_date", "")),
+                "quality_score": float(x.get("quality_score", 0.0) or 0.0),
+            }
+            for x in strict_items[:20]
+        ],
     }
     return digest_rows, usage
 
@@ -293,14 +331,24 @@ def format_digest_response(profile: PromptProfile, rows: list[dict[str, str]], u
         f"posts_added={usage.get('telegram_posts_added', 0)}, "
         f"errors={usage.get('telegram_errors_count', 0)}"
     )
+    if "perplexity_seed_status" in usage:
+        lines.append(
+            "Perplexity seed: "
+            f"status={usage.get('perplexity_seed_status', 'n/a')}, "
+            f"sender_messages={usage.get('perplexity_seed_sender_messages', 0)}, "
+            f"slot_matched_reports={usage.get('perplexity_seed_profile_messages', 0)}, "
+            f"sender_filter={usage.get('perplexity_seed_sender_filter', 'n/a')}"
+        )
     if "followup_plan_status" in usage or "followup_search_status" in usage:
         lines.append(
             "Adaptive follow-up: "
-            f"seed={usage.get('perplexity_seed_status', 'n/a')}, "
+            f"seed_status={usage.get('perplexity_seed_status', 'n/a')}, "
             f"plan={usage.get('followup_plan_status', 'n/a')}, "
             f"queries={usage.get('followup_plan_queries_count', 0)}, "
             f"runs={usage.get('followup_search_runs_executed', 0)}, "
             f"rows_added={usage.get('followup_search_rows_added', 0)}, "
+            f"rows_after_merge={usage.get('followup_rows_after_merge', 0)}, "
+            f"final_rows={usage.get('final_rows_count', 0)}, "
             f"credits={float(usage.get('followup_search_credits', 0.0)):.1f}"
         )
     if "openrouter_filter_status" in usage:
@@ -310,5 +358,13 @@ def format_digest_response(profile: PromptProfile, rows: list[dict[str, str]], u
             f"input={usage.get('openrouter_filter_input_items', 0)}, "
             f"output={usage.get('openrouter_filter_output_items', 0)}, "
             f"removed={usage.get('openrouter_filter_removed_items', 0)}"
+        )
+    if "openrouter_pipeline_status" in usage or "openrouter_stage1_status" in usage:
+        lines.append(
+            "OpenRouter 3-stage: "
+            f"pipeline={usage.get('openrouter_pipeline_status', 'n/a')}, "
+            f"s1={usage.get('openrouter_stage1_status', 'n/a')}, "
+            f"s2={usage.get('openrouter_stage2_status', 'n/a')}, "
+            f"s3={usage.get('openrouter_stage3_status', 'n/a')}"
         )
     return "\n".join(lines).strip()

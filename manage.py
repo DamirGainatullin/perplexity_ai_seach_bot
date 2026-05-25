@@ -4,7 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from core.db import db_add_chat, db_get_cached_response, db_init, db_save_cached_response
+from core.db import db_add_chat, db_delete_cached_response, db_get_cached_response, db_init, db_save_cached_response
 from core.env import load_env, read_text_with_fallback, resolve_timezone
 from core.telegram_api import tg_get_updates, tg_send_text
 from pipelines.adaptive_followup import (
@@ -17,7 +17,7 @@ from pipelines.adaptive_followup import (
 )
 from pipelines.engine import format_digest_response, run_budget_pipeline
 from pipelines.models import PromptProfile
-from pipelines.openrouter_filter import DEFAULT_OPENROUTER_MODEL, filter_digest_rows_with_openrouter
+from pipelines.openrouter_filter import DEFAULT_OPENROUTER_MODEL, run_three_stage_openrouter_pipeline
 from pipelines.perplexity_seed import load_latest_perplexity_summary_for_profile
 from pipelines.profiles import load_profiles
 
@@ -27,6 +27,14 @@ ENV_PATH = BASE_DIR / ".env"
 PROMPTS_DIR = BASE_DIR / "prompts"
 DB_PATH = BASE_DIR / "weekly_bot.sqlite3"
 DEFAULT_TZ = "Europe/Moscow"
+CLEAR_TARGET_ALIASES = {
+    "logistic": "logistics",
+    "logistics": "logistics",
+    "metanol": "metanol",
+    "methanol": "metanol",
+    "precursors": "precursors",
+    "rop": "rop",
+}
 
 
 def _safe_bool(raw: str | None, default: bool) -> bool:
@@ -57,6 +65,19 @@ def get_prompt_commands(profiles: dict[str, PromptProfile]) -> dict[str, Path]:
     return {command: profile.prompt_path for command, profile in profiles.items()}
 
 
+def _resolve_clear_profile(profiles: dict[str, PromptProfile], command: str) -> PromptProfile | None:
+    if not command.startswith("/clear:"):
+        return None
+    raw_target = command.split(":", 1)[1].strip().strip(",; ")
+    if not raw_target:
+        return None
+    normalized = CLEAR_TARGET_ALIASES.get(raw_target.lower(), raw_target.lower())
+    for profile in profiles.values():
+        if profile.name.lower() == normalized:
+            return profile
+    return None
+
+
 async def generate_by_profile(
     tavily_api_key: str,
     openrouter_api_key: str,
@@ -68,12 +89,47 @@ async def generate_by_profile(
     profile: PromptProfile,
     tz,
 ) -> str:
+    response_text, _usage = await generate_by_profile_with_usage(
+        tavily_api_key,
+        openrouter_api_key,
+        openrouter_model,
+        adaptive_followup_enabled,
+        followup_credit_cap,
+        followup_max_queries,
+        followup_max_results,
+        profile,
+        tz,
+        use_cache=True,
+        persist_cache=True,
+    )
+    return response_text
+
+
+async def generate_by_profile_with_usage(
+    tavily_api_key: str,
+    openrouter_api_key: str,
+    openrouter_model: str,
+    adaptive_followup_enabled: bool,
+    followup_credit_cap: float,
+    followup_max_queries: int,
+    followup_max_results: int,
+    profile: PromptProfile,
+    tz,
+    *,
+    use_cache: bool = True,
+    persist_cache: bool = True,
+) -> tuple[str, dict[str, Any]]:
     prompt_name = profile.name
     now_date = datetime.now(tz).date()
     cache_date = now_date.isoformat()
-    cached = db_get_cached_response(DB_PATH, prompt_name, cache_date)
-    if cached is not None:
-        return cached
+    if use_cache:
+        cached = db_get_cached_response(DB_PATH, prompt_name, cache_date)
+        if cached is not None:
+            return cached, {
+                "cache_hit": True,
+                "cache_date": cache_date,
+                "prompt_name": prompt_name,
+            }
 
     prompt_text = read_text_with_fallback(profile.prompt_path)
     rows, usage = await asyncio.to_thread(
@@ -122,16 +178,21 @@ async def generate_by_profile(
         usage["followup_rows_after_merge"] = len(rows)
 
     rows, filter_usage = await asyncio.to_thread(
-        filter_digest_rows_with_openrouter,
+        run_three_stage_openrouter_pipeline,
         rows,
         prompt_text,
         openrouter_api_key,
         openrouter_model,
     )
     usage.update(filter_usage)
+    usage["final_rows_count"] = len(rows)
+    usage["cache_hit"] = False
+    usage["cache_date"] = cache_date
+    usage["prompt_name"] = prompt_name
     response_text = format_digest_response(profile, rows, usage)
-    db_save_cached_response(DB_PATH, prompt_name, cache_date, response_text)
-    return response_text
+    if persist_cache:
+        db_save_cached_response(DB_PATH, prompt_name, cache_date, response_text)
+    return response_text, usage
 
 
 async def handle_start(bot_token: str, chat_id: int, commands: dict[str, Path]) -> None:
@@ -183,6 +244,26 @@ async def handle_prompt_command(
         await tg_send_text(bot_token, chat_id, f"Ошибка при запросе {command}: {exc}")
 
 
+async def handle_clear_command(
+    bot_token: str,
+    chat_id: int,
+    command: str,
+    profiles: dict[str, PromptProfile],
+    tz,
+    request_lock: asyncio.Lock,
+) -> None:
+    profile = _resolve_clear_profile(profiles, command)
+    if profile is None:
+        return
+    cache_date = datetime.now(tz).date().isoformat()
+    async with request_lock:
+        deleted = await asyncio.to_thread(db_delete_cached_response, DB_PATH, profile.name, cache_date)
+    if deleted > 0:
+        await tg_send_text(bot_token, chat_id, f"Кэш за {cache_date} для {profile.name} очищен.")
+    else:
+        await tg_send_text(bot_token, chat_id, f"Кэш за {cache_date} для {profile.name} уже пуст.")
+
+
 async def poll_loop(
     bot_token: str,
     profiles: dict[str, PromptProfile],
@@ -214,6 +295,15 @@ async def poll_loop(
                 command = text.split()[0].split("@")[0].lower()
                 if command == "/start":
                     await handle_start(bot_token, chat_id, get_prompt_commands(profiles))
+                elif command.startswith("/clear:"):
+                    await handle_clear_command(
+                        bot_token,
+                        chat_id,
+                        command,
+                        profiles,
+                        tz,
+                        request_lock,
+                    )
                 elif command in profiles:
                     await handle_prompt_command(
                         bot_token,
@@ -303,3 +393,6 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("Bot stopped")
+
+
+# For local tests - python run_local_profile.py --command /logistics --no-cache 

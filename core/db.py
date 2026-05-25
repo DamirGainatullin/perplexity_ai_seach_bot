@@ -67,3 +67,14 @@ def db_save_cached_response(db_path: Path, prompt_name: str, cache_date: str, re
             (prompt_name, cache_date, response, datetime.utcnow().isoformat(timespec="seconds")),
         )
 
+
+def db_delete_cached_response(db_path: Path, prompt_name: str, cache_date: str) -> int:
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.execute(
+            """
+            DELETE FROM prompt_cache
+            WHERE prompt_name = ? AND cache_date = ?
+            """,
+            (prompt_name, cache_date),
+        )
+    return int(cursor.rowcount or 0)

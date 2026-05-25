@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -16,12 +16,13 @@ class SlotConfig:
 
 
 PROFILE_SLOTS: dict[str, SlotConfig | None] = {
-    "logistics": SlotConfig(hour=18, minute=0, before_min=5, after_min=5),
-    "metanol": SlotConfig(hour=18, minute=30, before_min=5, after_min=5),
+    "logistics": SlotConfig(hour=18, minute=0, before_min=5, after_min=10),
+    "metanol": SlotConfig(hour=18, minute=30, before_min=5, after_min=10),
     # Placeholders for future schedule setup.
     "precursors": None,
     "rop": None,
 }
+PERPLEXITY_ALLOWED_SENDER = "team@mail.perplexity.ai"
 
 
 def _resolve_moscow_tz():
@@ -33,6 +34,22 @@ def _resolve_moscow_tz():
 
 def _message_text(item) -> str:
     return (item.body_text or item.snippet or "").strip()
+
+
+def _extract_sender_email(raw_sender: str) -> str:
+    sender = (raw_sender or "").strip().lower()
+    if not sender:
+        return ""
+    if "<" in sender and ">" in sender:
+        left = sender.find("<")
+        right = sender.find(">", left + 1)
+        if left != -1 and right != -1:
+            sender = sender[left + 1 : right].strip()
+    return sender
+
+
+def _is_allowed_perplexity_sender(raw_sender: str) -> bool:
+    return _extract_sender_email(raw_sender) == PERPLEXITY_ALLOWED_SENDER
 
 
 def _minutes_from_slot(local_dt: datetime, slot: SlotConfig) -> float:
@@ -74,6 +91,11 @@ def load_latest_perplexity_summary_for_profile(
 
     try:
         connector = GmailConnector.from_env(base_dir=base_dir)
+        connector.config = replace(
+            connector.config,
+            from_filters=(PERPLEXITY_ALLOWED_SENDER,),
+            subject_filters=(),
+        )
         messages = connector.fetch_messages(prompt_topics=None)
     except Exception as exc:
         return "", {"perplexity_seed_status": f"error_fetch: {exc}"}
@@ -81,7 +103,11 @@ def load_latest_perplexity_summary_for_profile(
     msk_tz = _resolve_moscow_tz()
     assigned: list[tuple[Any, float, datetime]] = []
     parsed_with_date = 0
+    perplexity_sender_messages = 0
     for item in messages:
+        if not _is_allowed_perplexity_sender(getattr(item, "sender", "")):
+            continue
+        perplexity_sender_messages += 1
         if not item.internal_date:
             continue
         parsed_with_date += 1
@@ -101,7 +127,9 @@ def load_latest_perplexity_summary_for_profile(
         return "", {
             "perplexity_seed_status": "not_found_in_time_window",
             "perplexity_seed_total_messages": len(messages),
+            "perplexity_seed_sender_messages": perplexity_sender_messages,
             "perplexity_seed_messages_with_date": parsed_with_date,
+            "perplexity_seed_sender_filter": PERPLEXITY_ALLOWED_SENDER,
         }
 
     assigned.sort(key=lambda x: ((x[0].internal_date or datetime.min), -x[1]), reverse=True)
@@ -114,10 +142,13 @@ def load_latest_perplexity_summary_for_profile(
     summary = summary[:max_chars]
     meta = {
         "perplexity_seed_status": "ok",
+        "perplexity_seed_total_messages": len(messages),
+        "perplexity_seed_sender_messages": perplexity_sender_messages,
         "perplexity_seed_profile_messages": len(assigned),
         "perplexity_seed_slot": f"{slot.hour:02d}:{slot.minute:02d}",
         "perplexity_seed_slot_abs_delta_min": round(float(delta_min), 1),
         "perplexity_seed_local_time": latest_local_dt.isoformat(timespec="seconds"),
+        "perplexity_seed_sender_filter": PERPLEXITY_ALLOWED_SENDER,
         "perplexity_seed_subject": latest.subject,
         "perplexity_seed_sender": latest.sender,
         "perplexity_seed_chars": len(summary),
