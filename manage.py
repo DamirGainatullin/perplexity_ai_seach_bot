@@ -174,7 +174,7 @@ async def generate_by_profile_with_usage(
             followup_meta.get("followup_search_credits", 0.0)
         )
         if extra_rows:
-            rows = merge_digest_rows(rows, extra_rows, limit=15)
+            rows = merge_digest_rows(rows, extra_rows, limit=30)
         usage["followup_rows_after_merge"] = len(rows)
 
     rows, filter_usage = await asyncio.to_thread(

@@ -22,14 +22,18 @@ STAGE2_PROMPT_FILE = "stage2_summarize.txt"
 STAGE3_PROMPT_FILE = "stage3_finalize.txt"
 
 DEFAULT_LEGACY_PROMPT_TEMPLATE = """
-You are a strict relevance filter for a legal and regulatory news digest.
-Use the profile topic specification below.
-Keep only materials relevant to the topic and remove duplicates or near-duplicates.
-Do not invent facts. Do not change source facts.
-Return STRICT JSON only (no markdown):
+Ты фильтр релевантности для юридической новостной сводки.
+Используй профильную тематику из PROFILE_TOPIC_SPEC.
+
+Требования:
+- Оставь только релевантные материалы.
+- Удали дубли и почти-дубли.
+- Не выдумывай факты и не искажай исходные данные.
+
+Верни строго JSON без markdown:
 {"keep_indices":[1,2,3]}
-Indices are 1-based and refer to the input materials list.
-If nothing is relevant, return:
+Индексы 1-based и относятся к входному списку materials.
+Если ничего не подходит, верни:
 {"keep_indices":[]}
 
 PROFILE_TOPIC_SPEC:
@@ -37,54 +41,62 @@ PROFILE_TOPIC_SPEC:
 """.strip()
 
 DEFAULT_STAGE1_PROMPT_TEMPLATE = """
-You are Stage 1 of a 3-stage editorial pipeline for legal news.
-Task: primary filtering and deduplication only.
-1. Keep only materials relevant to PROFILE_TOPIC_SPEC.
-2. Remove exact duplicates and near-duplicates.
-3. Keep source diversity when possible.
-4. Do NOT summarize or rewrite content here.
-5. Do NOT invent facts.
-Return STRICT JSON only (no markdown):
+Ты этап 1 трёхэтапного редакционного контура юридической сводки.
+Задача: первичная фильтрация и дедупликация.
+
+Требования:
+1) Оставь только материалы, релевантные тематике PROFILE_TOPIC_SPEC.
+2) Удали дубли и почти-дубли (одно и то же событие из разных источников).
+3) По возможности сохрани разнообразие источников.
+4) На этом этапе не пересказывай и не переписывай тексты.
+5) Не выдумывай факты.
+
+Верни строго JSON без markdown:
 {"keep_indices":[1,2,3]}
-Indices are 1-based and refer to input materials.
-If nothing is relevant, return {"keep_indices":[]}.
+Индексы 1-based и относятся к входному списку materials.
+Если ничего не подходит, верни: {"keep_indices":[]}.
 
 PROFILE_TOPIC_SPEC:
 {{PROFILE_PROMPT}}
 """.strip()
 
 DEFAULT_STAGE2_PROMPT_TEMPLATE = """
-You are Stage 2 of a 3-stage editorial pipeline.
-Task: summarization only (no filtering).
-For each material, produce a complete concise summary preserving key legal facts, actors,
-dates, numbers, and obligations/sanctions if present.
-Rules:
-- Do not invent facts.
-- Keep neutral legal style.
-- One summary per input index.
-- Target length: 350-900 characters per summary.
-Return STRICT JSON only:
+Ты этап 2 трёхэтапного редакционного контура юридической сводки.
+Задача: суммаризация (без дополнительной фильтрации).
+
+Для каждого входного материала подготовь краткое, но полноценное резюме.
+Сохраняй ключевые юридические факты: субъект, действие, дату, номера документов,
+обязанности, запреты, ответственность, санкции (если есть).
+
+Правила:
+- Не выдумывай факты.
+- Стиль нейтральный, юридически аккуратный.
+- Один summary на один index.
+- Целевая длина summary: 350-900 символов.
+
+Верни строго JSON:
 {"items":[{"index":1,"summary":"..."}]}
-If some item cannot be summarized confidently, omit it from items.
+Если по элементу нельзя уверенно сделать summary, пропусти его.
 
 PROFILE_TOPIC_SPEC:
 {{PROFILE_PROMPT}}
 """.strip()
 
 DEFAULT_STAGE3_PROMPT_TEMPLATE = """
-You are Stage 3 of a 3-stage editorial pipeline.
-Task: final editorial filtering and presentation shaping.
-Input already passed primary filter and has draft summaries.
-Actions:
-1. Do final relevance check against PROFILE_TOPIC_SPEC.
-2. Optionally remove leftovers that are weakly relevant.
-3. Group/classify each kept item into a concise legal category.
-4. Rewrite title/summary for clarity without changing facts.
-5. Remove remaining duplicates.
-Return STRICT JSON only:
+Ты этап 3 трёхэтапного редакционного контура юридической сводки.
+Задача: финальная фильтрация и подготовка карточек к выдаче.
+
+Действия:
+1) Ещё раз проверь релевантность PROFILE_TOPIC_SPEC.
+2) Удали слабые по релевантности остатки.
+3) Проставь каждой новости короткую юридическую категорию.
+4) При необходимости переформулируй заголовок и summary для ясности без изменения фактов.
+5) Удали оставшиеся дубли.
+
+Верни строго JSON:
 {"items":[{"index":1,"category":"...","title":"...","summary":"..."}]}
-Indices are 1-based against the input list of this stage.
-If nothing should be kept, return {"items":[]}.
+Индексы 1-based относительно входного списка данного этапа.
+Если оставлять нечего, верни: {"items":[]}.
 
 PROFILE_TOPIC_SPEC:
 {{PROFILE_PROMPT}}
@@ -165,6 +177,46 @@ def _build_material_payload(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
             }
         )
     return payload
+
+
+def _is_telegram_url(url: str) -> bool:
+    value = (url or "").strip().lower()
+    return value.startswith("https://t.me/") or value.startswith("http://t.me/")
+
+
+def _ensure_web_presence(
+    final_rows: list[dict[str, str]],
+    source_rows: list[dict[str, str]],
+    *,
+    min_web_rows: int = 1,
+    limit: int = 15,
+) -> tuple[list[dict[str, str]], int]:
+    if not final_rows:
+        return final_rows, 0
+    current_web = [row for row in final_rows if not _is_telegram_url(str(row.get("url", "")))]
+    if len(current_web) >= min_web_rows:
+        return final_rows, 0
+
+    existing_urls = {str(row.get("url", "")).strip() for row in final_rows if str(row.get("url", "")).strip()}
+    candidates = [
+        row
+        for row in source_rows
+        if (not _is_telegram_url(str(row.get("url", ""))))
+        and (str(row.get("url", "")).strip() not in existing_urls)
+        and str(row.get("url", "")).strip()
+    ]
+    if not candidates:
+        return final_rows, 0
+
+    candidates.sort(key=lambda x: str(x.get("date", "")), reverse=True)
+    need = max(0, min_web_rows - len(current_web))
+    additions = candidates[:need]
+    if not additions:
+        return final_rows, 0
+
+    merged = list(final_rows) + additions
+    merged.sort(key=lambda x: str(x.get("date", "")), reverse=True)
+    return merged[:limit], len(additions)
 
 
 def _call_openrouter_json(
@@ -538,6 +590,7 @@ def run_three_stage_openrouter_pipeline(
     if stage2_usage.get("openrouter_stage2_status") == "ok":
         current_rows = stage2_rows
 
+    pre_stage3_rows = list(current_rows)
     stage3_rows, stage3_usage = _stage3_finalize_rows(
         current_rows,
         prompt_text,
@@ -577,6 +630,8 @@ def run_three_stage_openrouter_pipeline(
         )
         usage["openrouter_pipeline_status"] = "fallback_legacy"
         usage["openrouter_pipeline_fallback"] = "legacy_filter"
+        legacy_rows, legacy_diversity_added = _ensure_web_presence(legacy_rows, rows, min_web_rows=0, limit=15)
+        usage["openrouter_source_diversity_added_web"] = legacy_diversity_added
         for key, value in legacy_usage.items():
             usage[f"openrouter_legacy_{key}"] = value
         usage.update(legacy_usage)
@@ -588,6 +643,14 @@ def run_three_stage_openrouter_pipeline(
         pipeline_status = "partial"
     else:
         pipeline_status = "error"
+
+    current_rows, diversity_added = _ensure_web_presence(
+        current_rows,
+        rows,
+        min_web_rows=0,
+        limit=15,
+    )
+    usage["openrouter_source_diversity_added_web"] = diversity_added
 
     total_prompt_tokens = int(stage1_usage.get("openrouter_stage1_prompt_tokens", 0) or 0) + int(
         stage2_usage.get("openrouter_stage2_prompt_tokens", 0) or 0

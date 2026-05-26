@@ -12,8 +12,6 @@ from pipelines.helpers import (
     extract_urls,
     group_domains,
     infer_category,
-    is_topic_related,
-    legal_score,
     parse_date_candidates,
     parse_date_from_url,
     parse_published_iso,
@@ -133,15 +131,10 @@ def run_budget_pipeline(
             url = item.get("url") or ""
             if not url:
                 continue
-            text = f"{item.get('title', '')} {item.get('content', '')}"
-            if not is_topic_related(text, profile.topic_keywords):
-                continue
-            keyword_score = legal_score(text, profile.legal_keywords)
-            score = keyword_score + float(item.get("score", 0.0)) * 4.0
+            score = float(item.get("score", 0.0) or 0.0)
             candidate = dict(item)
             candidate["strategy"] = run.rule.strategy
             candidate["quality_score"] = score
-            candidate["keyword_score"] = keyword_score
             candidate["published_iso"] = parse_published_iso(str(candidate.get("published_date", "")))
             url_date = parse_date_from_url(url)
             candidate["url_date_iso"] = url_date.isoformat() if url_date else ""
@@ -175,49 +168,81 @@ def run_budget_pipeline(
             if url:
                 extracted_by_url[url] = entry
 
-    # Stage 5: apply strict 7-day filter using published date, URL date, then extract fallback.
+    # Stage 5: date resolution + hard out-of-window guard.
+    # If a reliable date is found and it is outside the 7-day window, the web item is dropped.
+    # If date cannot be resolved, the item is kept with empty date.
     start_d = date.fromisoformat(start_date)
     end_d = date.fromisoformat(end_date)
     strict_items: list[dict[str, Any]] = []
+    web_items_total = 0
+    web_items_in_week = 0
+    web_items_with_resolved_date = 0
+    web_items_without_date = 0
+    web_items_out_of_week_dropped = 0
     for item in ranked:
         url = item.get("url", "")
         in_window = False
         effective_date = ""
         published_iso = str(item.get("published_iso", "") or "")
         url_date_iso = str(item.get("url_date_iso", "") or "")
+        resolved_dates: list[date] = []
+        text_head = " ".join(f"{item.get('title', '')} {item.get('content', '')}".split())[:2500]
+        for cand in parse_date_candidates(text_head):
+            resolved_dates.append(cand)
+            if start_d <= cand <= end_d:
+                in_window = True
+                effective_date = max(effective_date, cand.isoformat())
 
         if published_iso:
             try:
                 pub_d = date.fromisoformat(published_iso)
+                resolved_dates.append(pub_d)
                 if start_d <= pub_d <= end_d:
                     in_window = True
-                    effective_date = pub_d.isoformat()
+                    effective_date = max(effective_date, pub_d.isoformat())
             except ValueError:
                 pass
-        if (not in_window) and url_date_iso:
+        if url_date_iso:
             try:
                 url_d = date.fromisoformat(url_date_iso)
+                resolved_dates.append(url_d)
                 if start_d <= url_d <= end_d:
                     in_window = True
-                    effective_date = url_d.isoformat()
+                    effective_date = max(effective_date, url_d.isoformat())
             except ValueError:
                 pass
-        if (not in_window) and url in extracted_by_url:
+        if url in extracted_by_url:
             raw = str(extracted_by_url[url].get("raw_content", "") or extracted_by_url[url].get("content", ""))
-            head = " ".join(raw.split())[:1800]
+            head = " ".join(raw.split())[:6000]
             for cand in parse_date_candidates(head):
+                resolved_dates.append(cand)
                 if start_d <= cand <= end_d:
                     in_window = True
-                    effective_date = cand.isoformat()
-                    break
+                    effective_date = max(effective_date, cand.isoformat())
+
+        if resolved_dates and (not in_window):
+            # Hard date guard: if we can confirm date and it is outside last 7 days, drop item.
+            web_items_out_of_week_dropped += 1
+            continue
+
+        if (not effective_date) and resolved_dates:
+            # If we resolved multiple in-window dates, keep the latest for sorting/debug.
+            best_date = max(resolved_dates)
+            effective_date = best_date.isoformat()
 
         item["strict_in_week"] = in_window
         item["strict_effective_date"] = effective_date
-        if in_window and int(item.get("keyword_score", 0)) > 0:
-            strict_items.append(item)
+        strict_items.append(item)
+        web_items_total += 1
+        if in_window:
+            web_items_in_week += 1
+        if effective_date:
+            web_items_with_resolved_date += 1
+        else:
+            web_items_without_date += 1
 
     strict_items.sort(
-        key=lambda x: (x.get("strict_effective_date", ""), float(x.get("quality_score", 0.0))),
+        key=lambda x: (float(x.get("quality_score", 0.0)), x.get("strict_effective_date", "")),
         reverse=True,
     )
 
@@ -252,13 +277,16 @@ def run_budget_pipeline(
 
     strict_items.extend(telegram_items)
     strict_items.sort(
-        key=lambda x: (x.get("strict_effective_date", ""), float(x.get("quality_score", 0.0))),
+        key=lambda x: (float(x.get("quality_score", 0.0)), x.get("strict_effective_date", "")),
         reverse=True,
     )
 
     # Stage 6: build final digest rows in standard output format.
+    # Keep a wider pre-LLM candidate pool so web sources are less likely to be crowded out.
     digest_rows: list[dict[str, str]] = []
-    for item in strict_items[:15]:
+    pre_llm_limit = 30
+    pre_llm_candidates = strict_items[:pre_llm_limit]
+    for item in pre_llm_candidates:
         text_for_category = f"{item.get('title', '')} {item.get('content', '')}"
         digest_rows.append(
             {
@@ -268,6 +296,7 @@ def run_budget_pipeline(
                 "content": str(item.get("content", "")).strip(),
                 "url": str(item.get("url", "")).strip(),
                 "date": str(item.get("strict_effective_date", "")).strip(),
+                "rank_score": f"{float(item.get('quality_score', 0.0) or 0.0):.6f}",
             }
         )
 
@@ -282,10 +311,23 @@ def run_budget_pipeline(
         "start_date": start_date,
         "end_date": end_date,
         "strict_items_count": len(strict_items),
+        "web_items_total": web_items_total,
+        "web_items_in_week": web_items_in_week,
+        "web_items_with_resolved_date": web_items_with_resolved_date,
+        "web_items_without_date": web_items_without_date,
+        "web_items_out_of_week_dropped": web_items_out_of_week_dropped,
         "telegram_channels_total": len(telegram_channels),
         "telegram_channels_ok": len(telegram_channels) - len(telegram_errors),
         "telegram_errors_count": len(telegram_errors),
         "telegram_posts_added": len(telegram_items),
+        "pre_llm_limit": pre_llm_limit,
+        "pre_llm_candidates_total": len(pre_llm_candidates),
+        "pre_llm_candidates_tg": sum(
+            1 for x in pre_llm_candidates if str(x.get("url", "")).strip().startswith("https://t.me/")
+        ),
+        "pre_llm_candidates_web": sum(
+            1 for x in pre_llm_candidates if not str(x.get("url", "")).strip().startswith("https://t.me/")
+        ),
         "search_run_details": search_run_details,
         "extract_urls_requested": extract_subset,
         "extract_urls_extracted": len(extracted_by_url),
@@ -331,6 +373,23 @@ def format_digest_response(profile: PromptProfile, rows: list[dict[str, str]], u
         f"posts_added={usage.get('telegram_posts_added', 0)}, "
         f"errors={usage.get('telegram_errors_count', 0)}"
     )
+    if "web_items_total" in usage:
+        lines.append(
+            "Web sources: "
+            f"total={usage.get('web_items_total', 0)}, "
+            f"in_week={usage.get('web_items_in_week', 0)}, "
+            f"resolved_date={usage.get('web_items_with_resolved_date', 0)}, "
+            f"no_date={usage.get('web_items_without_date', 0)}, "
+            f"dropped_out_of_week={usage.get('web_items_out_of_week_dropped', 0)}"
+        )
+    if "pre_llm_candidates_total" in usage:
+        lines.append(
+            "Pre-LLM mix: "
+            f"limit={usage.get('pre_llm_limit', 0)}, "
+            f"total={usage.get('pre_llm_candidates_total', 0)}, "
+            f"web={usage.get('pre_llm_candidates_web', 0)}, "
+            f"tg={usage.get('pre_llm_candidates_tg', 0)}"
+        )
     if "perplexity_seed_status" in usage:
         lines.append(
             "Perplexity seed: "

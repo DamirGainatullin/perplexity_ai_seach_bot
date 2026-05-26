@@ -18,8 +18,8 @@ class SlotConfig:
 PROFILE_SLOTS: dict[str, SlotConfig | None] = {
     "logistics": SlotConfig(hour=18, minute=0, before_min=5, after_min=10),
     "metanol": SlotConfig(hour=18, minute=30, before_min=5, after_min=10),
-    # Placeholders for future schedule setup.
-    "precursors": None,
+    "precursors": SlotConfig(hour=19, minute=0, before_min=5, after_min=10),
+    # Placeholder for future schedule setup.
     "rop": None,
 }
 PERPLEXITY_ALLOWED_SENDER = "team@mail.perplexity.ai"

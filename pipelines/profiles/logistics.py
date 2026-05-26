@@ -120,6 +120,5 @@ def build_logistics_profile(prompts_dir: Path) -> PromptProfile:
                 domain_scope="all_ru",
             ),
         ),
-        budget=BudgetConfig(target_credits=30, search_run_limit=8, max_results=6, extract_url_limit=8),
+        budget=BudgetConfig(target_credits=30, search_run_limit=8, max_results=10, extract_url_limit=8),
     )
-
