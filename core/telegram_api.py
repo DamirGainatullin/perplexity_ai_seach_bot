@@ -5,6 +5,7 @@ from typing import Optional
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import requests
+from requests.exceptions import HTTPError, InvalidSchema, RequestException
 
 
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/{method}"
@@ -69,7 +70,7 @@ def tg_request(bot_token: str, method: str, payload: Optional[dict] = None) -> d
         response = requests.request(**request_kwargs)
         response.raise_for_status()
         body = response.json()
-    except requests.HTTPError as exc:
+    except HTTPError as exc:
         details = ""
         if exc.response is not None:
             details = exc.response.text[:1000]
@@ -77,13 +78,13 @@ def tg_request(bot_token: str, method: str, payload: Optional[dict] = None) -> d
         else:
             status_code = "unknown"
         raise RuntimeError(f"Telegram API error {status_code}: {details}") from exc
-    except requests.InvalidSchema as exc:
+    except InvalidSchema as exc:
         if _TELEGRAM_PROXY_URL.lower().startswith("socks"):
             raise RuntimeError(
                 "Telegram SOCKS proxy requires PySocks support. Install dependencies from requirements.txt."
             ) from exc
         raise RuntimeError(f"Telegram network error: {exc}") from exc
-    except requests.RequestException as exc:
+    except RequestException as exc:
         raise RuntimeError(f"Telegram network error: {exc}") from exc
     if not body.get("ok"):
         raise RuntimeError(f"Telegram API returned error: {body}")
