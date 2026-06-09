@@ -23,6 +23,7 @@ from pipelines.perplexity_seed import (
     load_aggregated_perplexity_summary_for_profile,
 )
 from pipelines.profiles import load_profiles
+from pipelines.telegram_feed import configure_telegram_feed_proxy
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -393,6 +394,7 @@ async def main() -> None:
         raise RuntimeError("No supported prompt files found in prompts directory.")
 
     configure_telegram_proxy(settings["telegram_proxy_url"])
+    configure_telegram_feed_proxy(settings["telegram_proxy_url"])
     db_init(DB_PATH)
     request_lock = asyncio.Lock()
 

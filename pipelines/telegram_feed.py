@@ -4,6 +4,7 @@ from datetime import date, datetime
 from html import unescape
 
 import requests
+from requests.exceptions import InvalidSchema
 
 
 USER_AGENT = (
@@ -18,6 +19,7 @@ TEXT_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 TAG_RE = re.compile(r"<[^>]+>")
+_TELEGRAM_FEED_PROXY_URL = ""
 
 
 @dataclass(frozen=True)
@@ -28,6 +30,11 @@ class TelegramPost:
     published_iso: str
     text: str
     url: str
+
+
+def configure_telegram_feed_proxy(proxy_url: str) -> None:
+    global _TELEGRAM_FEED_PROXY_URL
+    _TELEGRAM_FEED_PROXY_URL = (proxy_url or "").strip()
 
 
 def extract_telegram_channels(include_domains: list[str]) -> list[str]:
@@ -55,12 +62,22 @@ def _clean_text(raw_html: str) -> str:
 
 
 def _fetch_channel_html(channel: str, timeout_sec: int = 20) -> str:
-    response = requests.get(
-        f"https://t.me/s/{channel}",
-        headers={"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9,ru;q=0.8"},
-        timeout=timeout_sec,
-        allow_redirects=True,
-    )
+    request_kwargs: dict[str, object] = {
+        "url": f"https://t.me/s/{channel}",
+        "headers": {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9,ru;q=0.8"},
+        "timeout": timeout_sec,
+        "allow_redirects": True,
+    }
+    if _TELEGRAM_FEED_PROXY_URL:
+        request_kwargs["proxies"] = {"http": _TELEGRAM_FEED_PROXY_URL, "https": _TELEGRAM_FEED_PROXY_URL}
+    try:
+        response = requests.get(**request_kwargs)
+    except InvalidSchema as exc:
+        if _TELEGRAM_FEED_PROXY_URL.lower().startswith("socks"):
+            raise RuntimeError(
+                "Telegram channel SOCKS proxy requires PySocks support. Install dependencies from requirements.txt."
+            ) from exc
+        raise
     response.raise_for_status()
     return response.text
 
