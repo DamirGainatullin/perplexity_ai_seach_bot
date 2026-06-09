@@ -27,6 +27,8 @@ DEFAULT_FOLLOWUP_MAX_RESULTS = 5
 DEFAULT_FOLLOWUP_MAX_QUERIES = 4
 FOLLOWUP_RU_ANCHORS = ("Россия", "РФ", "Минтранс", "НПА", "разъяснения")
 FOLLOWUP_EXTRACT_URL_LIMIT = 10
+FOLLOWUP_PLANNER_SUMMARY_MAX_CHARS = 12000
+FOLLOWUP_PLANNER_ROWS_LIMIT = 30
 
 
 def _extract_json_from_text(text: str) -> dict[str, Any] | None:
@@ -66,13 +68,14 @@ def _build_planner_prompt(prompt_text: str, max_queries: int) -> str:
         compact_prompt = compact_prompt[:4000] + "..."
     return (
         "Ты аналитик, который готовит дополнительные поисковые запросы для Tavily.\n"
-        "Входные данные: краткая сводка Perplexity и список уже найденных материалов.\n"
+        "Входные данные: агрегированная сводка Perplexity за несколько ежедневных отчетов и список уже найденных материалов.\n"
         "Цель: закрыть пробелы в покрытии темы из профиля.\n\n"
         "Сначала выполни отбор релевантных тезисов:\n"
         "1) Выдели из Perplexity только наиболее релевантные теме события/заголовки.\n"
         f"2) Выбери не более {max_queries} пунктов с максимальной юридической релевантностью.\n"
         "3) Приоритет: новые НПА, поправки, судебная практика, официальные разъяснения, правоприменение в РФ.\n"
-        "4) Игнорируй нерелевантные или слишком общие международные сюжеты, если нет прямой связи с регулированием в РФ.\n\n"
+        "4) Если одна и та же тема повторяется в нескольких ежедневных отчетах, объедини ее в один тезис и не дублируй.\n"
+        "5) Игнорируй нерелевантные или слишком общие международные сюжеты, если нет прямой связи с регулированием в РФ.\n\n"
         "Затем сформируй поисковые запросы:\n"
         "1) На каждый выбранный пункт — один запрос Tavily.\n"
         "2) Запросы должны быть на русском языке.\n"
@@ -92,10 +95,11 @@ def _build_planner_fallback_prompt(prompt_text: str, max_queries: int) -> str:
     if len(compact_prompt) > 3000:
         compact_prompt = compact_prompt[:3000] + "..."
     return (
-        "Ты формируешь дополнительные запросы для Tavily по сводке Perplexity.\n"
+        "Ты формируешь дополнительные запросы для Tavily по агрегированной сводке Perplexity за несколько ежедневных писем.\n"
         "Выбери только релевантные теме пункты и составь до "
         f"{max_queries}"
         " запросов.\n"
+        "Если одинаковая тема повторяется в нескольких письмах, не дублируй ее.\n"
         "Запросы должны быть на русском, юридически конкретные, без доменов и без site:.\n"
         "Не выдумывай факты.\n\n"
         "Верни строго JSON без markdown:\n"
@@ -233,10 +237,10 @@ def plan_followup_queries(
             "url": row.get("url", ""),
             "date": row.get("date", ""),
         }
-        for row in current_rows[:15]
+        for row in current_rows[:FOLLOWUP_PLANNER_ROWS_LIMIT]
     ]
     user_payload = {
-        "perplexity_summary": (perplexity_summary or "")[:6000],
+        "perplexity_summary": (perplexity_summary or "")[:FOLLOWUP_PLANNER_SUMMARY_MAX_CHARS],
         "current_tavily_results": rows_payload,
         "task": (
             "Выбери самые релевантные для темы тезисы из Perplexity, "
@@ -250,7 +254,7 @@ def plan_followup_queries(
         system_prompt=_build_planner_prompt(prompt_text, max_queries=max_queries),
         user_payload=user_payload,
         timeout_sec=timeout_sec,
-        max_tokens=500,
+        max_tokens=700,
     )
     if status == "ok" and isinstance(parsed, dict):
         queries_raw = parsed.get("queries")
@@ -264,6 +268,8 @@ def plan_followup_queries(
                 "followup_plan_queries_count": len(queries),
                 "followup_plan_queries": queries,
                 "followup_plan_queries_raw": raw_queries,
+                "followup_plan_rows_input_count": len(rows_payload),
+                "followup_plan_perplexity_summary_chars": len(user_payload["perplexity_summary"]),
                 "followup_plan_ru_anchors": list(FOLLOWUP_RU_ANCHORS),
                 "followup_plan_selected_headlines_count": len(selected_headlines),
                 "followup_plan_selected_headlines": selected_headlines,
@@ -273,7 +279,7 @@ def plan_followup_queries(
             }
 
     fallback_payload = {
-        "perplexity_summary": (perplexity_summary or "")[:6000],
+        "perplexity_summary": (perplexity_summary or "")[:FOLLOWUP_PLANNER_SUMMARY_MAX_CHARS],
         "task": (
             "Выбери самые релевантные для темы пункты и сформируй до 4 русскоязычных "
             "юридических поисковых запросов для Tavily."
@@ -285,7 +291,7 @@ def plan_followup_queries(
         system_prompt=_build_planner_fallback_prompt(prompt_text, max_queries=max_queries),
         user_payload=fallback_payload,
         timeout_sec=timeout_sec,
-        max_tokens=350,
+        max_tokens=500,
     )
     if status_fb != "ok" or not isinstance(parsed_fb, dict):
         return [], {
@@ -311,6 +317,8 @@ def plan_followup_queries(
         "followup_plan_queries_count": len(queries_fb),
         "followup_plan_queries": queries_fb,
         "followup_plan_queries_raw": raw_queries_fb,
+        "followup_plan_rows_input_count": len(rows_payload),
+        "followup_plan_perplexity_summary_chars": len(fallback_payload["perplexity_summary"]),
         "followup_plan_ru_anchors": list(FOLLOWUP_RU_ANCHORS),
         "followup_plan_selected_headlines_count": len(selected_headlines_fb),
         "followup_plan_selected_headlines": selected_headlines_fb,

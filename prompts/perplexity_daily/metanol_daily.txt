@@ -1,0 +1,34 @@
+Подготовь ежедневный обзор новостей и правовых изменений по теме регулирования оборота метанола и метанолсодержащих жидкостей на русском языке за последние 24 часа.
+
+Ищи публикации, связанные с:
+- ФЗ от 23.05.2025 N 108-ФЗ;
+- производством, хранением, транспортировкой, реализацией, уничтожением и утилизацией;
+- промышленным и техническим использованием;
+- техрегламентами ЕАЭС, ГОСТами и стандартами безопасности;
+- маркировкой, упаковкой, паспортизацией;
+- лицензированием;
+- административной и уголовной ответственностью;
+- контролем Роспотребнадзора, Росприроднадзора, МВД, Минпромторга.
+
+Включай только материалы о фактических изменениях за последние 24 часа:
+- новые НПА и проекты НПА;
+- судебная практика;
+- официальные разъяснения;
+- значимые регуляторные действия и правоприменение в РФ.
+
+Не включай:
+- старые публикации;
+- общие обзоры без новых фактов;
+- косвенные упоминания метанола без правового изменения.
+
+Формат ответа:
+1. 5-8 коротких пунктов по самым важным событиям.
+2. В каждом пункте: краткий заголовок и 1-2 предложения сути.
+3. Если за последние 24 часа существенных изменений нет, так и укажи.
+
+Приоритет источников:
+1. Официальные порталы и реестры.
+2. Аналитика юрфирм и правовые медиа.
+3. Telegram-каналы только как дополнительный сигнал.
+
+Используй только эти источники: http://szrf.pravo.gov.ru/, http://pravo.gov.ru/, https://rg.ru/, http://publication.pravo.gov.ru/, https://www.pgplaw.ru/analytics-and-brochures/alerts/, https://nextons.ru/news/, https://kept.ru/news/, https://bgplaw.com/mediahub/, https://www.consultant.ru/legalnews/, https://t.me/betterchance_ru, https://t.me/verbalegal, https://t.me/legal_edu, https://t.me/optimalogistic, https://t.me/denuolaw, https://t.me/tedo_business, https://t.me/kept_business, https://t.me/pgp_official, https://t.me/alumnipartnerslawfirm, https://t.me/Rosprirodnadzor_official, https://t.me/minpromtorg_ru, https://regulation.gov.ru/projects, https://minpromtorg.gov.ru/press-centre/news, https://rpn.gov.ru/press/news, https://gisp.gov.ru/mainpage/news, https://мвд.рф/news, https://www.gosnadzor.ru/news

@@ -6,7 +6,7 @@ from typing import Any, Optional
 
 from core.db import db_add_chat, db_delete_cached_response, db_get_cached_response, db_init, db_save_cached_response
 from core.env import load_env, read_text_with_fallback, resolve_timezone
-from core.telegram_api import tg_get_updates, tg_send_text
+from core.telegram_api import configure_telegram_proxy, mask_proxy_url, tg_get_updates, tg_send_text
 from pipelines.adaptive_followup import (
     DEFAULT_FOLLOWUP_CREDIT_CAP,
     DEFAULT_FOLLOWUP_MAX_QUERIES,
@@ -18,7 +18,10 @@ from pipelines.adaptive_followup import (
 from pipelines.engine import format_digest_response, run_budget_pipeline
 from pipelines.models import PromptProfile
 from pipelines.openrouter_filter import DEFAULT_OPENROUTER_MODEL, run_three_stage_openrouter_pipeline
-from pipelines.perplexity_seed import load_latest_perplexity_summary_for_profile
+from pipelines.perplexity_seed import (
+    is_perplexity_followup_enabled_for_profile,
+    load_aggregated_perplexity_summary_for_profile,
+)
 from pipelines.profiles import load_profiles
 
 
@@ -30,10 +33,21 @@ DEFAULT_TZ = "Europe/Moscow"
 CLEAR_TARGET_ALIASES = {
     "logistic": "logistics",
     "logistics": "logistics",
+    "chesny": "chesny_znak",
+    "chesny_znak": "chesny_znak",
+    "chesnyznak": "chesny_znak",
+    "honestsign": "chesny_znak",
+    "marking": "chesny_znak",
+    "markirovka": "chesny_znak",
+    "chz": "chesny_znak",
     "metanol": "metanol",
     "methanol": "metanol",
     "precursors": "precursors",
+    "prodazhi": "sales",
     "rop": "rop",
+    "sales": "sales",
+    "sale": "sales",
+    "spot": "spot",
 }
 
 
@@ -140,9 +154,9 @@ async def generate_by_profile_with_usage(
         now_date,
     )
 
-    if adaptive_followup_enabled:
+    if adaptive_followup_enabled and is_perplexity_followup_enabled_for_profile(profile.name):
         seed_summary, seed_meta = await asyncio.to_thread(
-            load_latest_perplexity_summary_for_profile,
+            load_aggregated_perplexity_summary_for_profile,
             profile.name,
             PROMPTS_DIR,
             BASE_DIR,
@@ -176,6 +190,24 @@ async def generate_by_profile_with_usage(
         if extra_rows:
             rows = merge_digest_rows(rows, extra_rows, limit=30)
         usage["followup_rows_after_merge"] = len(rows)
+    elif adaptive_followup_enabled:
+        usage.update(
+            {
+                "perplexity_seed_status": "skipped_profile_disabled",
+                "followup_plan_status": "skipped_profile_disabled",
+                "followup_search_status": "skipped_profile_disabled",
+                "followup_rows_after_merge": len(rows),
+            }
+        )
+    else:
+        usage.update(
+            {
+                "perplexity_seed_status": "skipped_globally_disabled",
+                "followup_plan_status": "skipped_globally_disabled",
+                "followup_search_status": "skipped_globally_disabled",
+                "followup_rows_after_merge": len(rows),
+            }
+        )
 
     rows, filter_usage = await asyncio.to_thread(
         run_three_stage_openrouter_pipeline,
@@ -337,6 +369,7 @@ def load_settings() -> dict[str, Any]:
     followup_credit_cap = max(0.0, _safe_float(env.get("FOLLOWUP_CREDIT_CAP"), DEFAULT_FOLLOWUP_CREDIT_CAP))
     followup_max_queries = max(1, _safe_int(env.get("FOLLOWUP_MAX_QUERIES"), DEFAULT_FOLLOWUP_MAX_QUERIES))
     followup_max_results = max(1, _safe_int(env.get("FOLLOWUP_MAX_RESULTS"), DEFAULT_FOLLOWUP_MAX_RESULTS))
+    telegram_proxy_url = env.get("TELEGRAM_PROXY_URL", "").strip()
 
     tz = resolve_timezone(env.get("TZ", DEFAULT_TZ))
     return {
@@ -348,6 +381,7 @@ def load_settings() -> dict[str, Any]:
         "followup_credit_cap": followup_credit_cap,
         "followup_max_queries": followup_max_queries,
         "followup_max_results": followup_max_results,
+        "telegram_proxy_url": telegram_proxy_url,
         "tz": tz,
     }
 
@@ -356,12 +390,17 @@ async def main() -> None:
     settings = load_settings()
     profiles = load_profiles(PROMPTS_DIR)
     if not profiles:
-        raise RuntimeError("No supported prompt files found (expected logistics.txt / metanol.txt)")
+        raise RuntimeError("No supported prompt files found in prompts directory.")
 
+    configure_telegram_proxy(settings["telegram_proxy_url"])
     db_init(DB_PATH)
     request_lock = asyncio.Lock()
 
     print(f"[startup] Prompt commands: {', '.join(sorted(profiles.keys()))}")
+    print(
+        "[startup] Telegram proxy: "
+        + (mask_proxy_url(settings["telegram_proxy_url"]) if settings["telegram_proxy_url"] else "disabled")
+    )
     print(
         "[startup] OpenRouter filter: "
         + ("enabled" if settings["openrouter_api_key"] else "disabled (OPENROUTER_API_KEY missing)")

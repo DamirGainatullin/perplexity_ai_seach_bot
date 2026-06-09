@@ -19,10 +19,15 @@ PROFILE_SLOTS: dict[str, SlotConfig | None] = {
     "logistics": SlotConfig(hour=18, minute=0, before_min=5, after_min=10),
     "metanol": SlotConfig(hour=18, minute=30, before_min=5, after_min=10),
     "precursors": SlotConfig(hour=19, minute=0, before_min=5, after_min=10),
+    "chesny_znak": None,
     # Placeholder for future schedule setup.
     "rop": None,
+    "sales": None,
+    "spot": None,
 }
 PERPLEXITY_ALLOWED_SENDER = "team@mail.perplexity.ai"
+PERPLEXITY_SEED_DAYS_BACK = 7
+PERPLEXITY_SEED_FETCH_MAX_RESULTS = 100
 
 
 def _resolve_moscow_tz():
@@ -30,6 +35,13 @@ def _resolve_moscow_tz():
         return ZoneInfo("Europe/Moscow")
     except Exception:
         return timezone(timedelta(hours=3))
+
+
+def is_perplexity_followup_enabled_for_profile(profile_name: str) -> bool:
+    profile_key = (profile_name or "").strip().lower()
+    if profile_key not in PROFILE_SLOTS:
+        return False
+    return PROFILE_SLOTS.get(profile_key) is not None
 
 
 def _message_text(item) -> str:
@@ -71,11 +83,46 @@ def _assign_profile_by_time(local_dt: datetime) -> tuple[str, float] | None:
     return candidates[0]
 
 
-def load_latest_perplexity_summary_for_profile(
+def _format_aggregated_seed_summary(
+    assigned: list[tuple[Any, float, datetime]],
+    max_chars: int,
+) -> tuple[str, int]:
+    blocks: list[str] = []
+    used_reports = 0
+    total_chars = 0
+
+    for item, abs_delta, local_dt in assigned:
+        body = _message_text(item)
+        if not body:
+            continue
+        block = (
+            f"[Perplexity report | local_time={local_dt.isoformat(timespec='seconds')} | "
+            f"slot_abs_delta_min={round(float(abs_delta), 1)}]\n"
+            f"Subject: {item.subject or '(no subject)'}\n"
+            f"{body.strip()}"
+        ).strip()
+        if not block:
+            continue
+
+        projected_len = total_chars + (2 if blocks else 0) + len(block)
+        if blocks and projected_len > max_chars:
+            break
+        if (not blocks) and len(block) > max_chars:
+            block = block[: max_chars - 3].rstrip() + "..."
+            projected_len = len(block)
+
+        blocks.append(block)
+        total_chars = projected_len
+        used_reports += 1
+
+    return "\n\n".join(blocks).strip(), used_reports
+
+
+def load_aggregated_perplexity_summary_for_profile(
     profile_name: str,
     prompts_dir: Path,
     base_dir: Path,
-    max_chars: int = 8000,
+    max_chars: int = 16000,
 ) -> tuple[str, dict[str, Any]]:
     profile_key = (profile_name or "").strip().lower()
     slot = PROFILE_SLOTS.get(profile_key)
@@ -93,6 +140,8 @@ def load_latest_perplexity_summary_for_profile(
         connector = GmailConnector.from_env(base_dir=base_dir)
         connector.config = replace(
             connector.config,
+            days_back=max(PERPLEXITY_SEED_DAYS_BACK, int(getattr(connector.config, "days_back", 0) or 0)),
+            max_results=max(PERPLEXITY_SEED_FETCH_MAX_RESULTS, int(getattr(connector.config, "max_results", 0) or 0)),
             from_filters=(PERPLEXITY_ALLOWED_SENDER,),
             subject_filters=(),
         )
@@ -133,24 +182,43 @@ def load_latest_perplexity_summary_for_profile(
         }
 
     assigned.sort(key=lambda x: ((x[0].internal_date or datetime.min), -x[1]), reverse=True)
-    latest, delta_min, latest_local_dt = assigned[0]
-
-    summary = _message_text(latest)
+    summary, used_reports = _format_aggregated_seed_summary(assigned, max_chars=max_chars)
     if not summary:
         return "", {"perplexity_seed_status": "empty_message_body"}
 
-    summary = summary[:max_chars]
+    latest_item, latest_delta_min, latest_local_dt = assigned[0]
+    oldest_item, oldest_delta_min, oldest_local_dt = assigned[-1]
     meta = {
-        "perplexity_seed_status": "ok",
+        "perplexity_seed_status": "ok_aggregated",
         "perplexity_seed_total_messages": len(messages),
         "perplexity_seed_sender_messages": perplexity_sender_messages,
         "perplexity_seed_profile_messages": len(assigned),
+        "perplexity_seed_reports_used": used_reports,
+        "perplexity_seed_days_back": PERPLEXITY_SEED_DAYS_BACK,
+        "perplexity_seed_fetch_max_results": PERPLEXITY_SEED_FETCH_MAX_RESULTS,
         "perplexity_seed_slot": f"{slot.hour:02d}:{slot.minute:02d}",
-        "perplexity_seed_slot_abs_delta_min": round(float(delta_min), 1),
-        "perplexity_seed_local_time": latest_local_dt.isoformat(timespec="seconds"),
+        "perplexity_seed_slot_abs_delta_min": round(float(latest_delta_min), 1),
+        "perplexity_seed_latest_local_time": latest_local_dt.isoformat(timespec="seconds"),
+        "perplexity_seed_oldest_local_time": oldest_local_dt.isoformat(timespec="seconds"),
         "perplexity_seed_sender_filter": PERPLEXITY_ALLOWED_SENDER,
-        "perplexity_seed_subject": latest.subject,
-        "perplexity_seed_sender": latest.sender,
+        "perplexity_seed_latest_subject": latest_item.subject,
+        "perplexity_seed_oldest_subject": oldest_item.subject,
+        "perplexity_seed_sender": latest_item.sender,
         "perplexity_seed_chars": len(summary),
     }
     return summary, meta
+
+
+# Backward-compatible alias for existing imports/call sites.
+def load_latest_perplexity_summary_for_profile(
+    profile_name: str,
+    prompts_dir: Path,
+    base_dir: Path,
+    max_chars: int = 16000,
+) -> tuple[str, dict[str, Any]]:
+    return load_aggregated_perplexity_summary_for_profile(
+        profile_name=profile_name,
+        prompts_dir=prompts_dir,
+        base_dir=base_dir,
+        max_chars=max_chars,
+    )

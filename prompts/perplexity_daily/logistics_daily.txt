@@ -1,0 +1,34 @@
+Подготовь ежедневный обзор правового регулирования логистики и смежных областей на русском языке за последние 24 часа.
+
+Тематика:
+- морское право;
+- транспортное право;
+- право железнодорожных перевозок;
+- автоперевозки;
+- договор транспортной экспедиции;
+- официальные разъяснения и судебная практика по перевозкам и логистике.
+
+Включай только материалы о фактических изменениях за последние 24 часа:
+- новые НПА и проекты НПА;
+- поправки;
+- судебная практика;
+- официальные разъяснения;
+- иные юридически значимые изменения правоприменения в РФ.
+
+Не включай:
+- старые материалы;
+- общую аналитику без новостей;
+- косвенные упоминания без фактического изменения;
+- нерелевантные международные сюжеты без прямой связи с регулированием в РФ.
+
+Формат ответа:
+1. 5-8 коротких пунктов по самым важным событиям.
+2. В каждом пункте: краткий заголовок и 1-2 предложения сути.
+3. Если за последние 24 часа существенных изменений нет, так и укажи.
+
+Приоритет источников:
+1. Официальные порталы: szrf.pravo.gov.ru, pravo.gov.ru, publication.pravo.gov.ru, vsrf.ru, mintrans.gov.ru.
+2. Аналитика юрфирм и правовые медиа.
+3. Telegram-каналы и отраслевые сообщения только как дополнительный сигнал.
+
+Используй только эти источники: http://szrf.pravo.gov.ru/, https://www.consultant.ru/legalnews/, https://www.garant.ru/news/, http://pravo.gov.ru/, https://rg.ru/, http://publication.pravo.gov.ru/documents/block/president, http://publication.pravo.gov.ru/documents/block/government, https://www.vsrf.ru/documents/own/?category=resolutions_plenum_supreme_court_russian&year=2025, https://mintrans.gov.ru/press-center, https://www.kontur-extern.ru/info, https://denuo.legal/ru/insights/news/, https://alumnipartners.ru/news/?filter=2, https://ul.su/news/, https://www.pgplaw.ru/analytics-and-brochures/alerts/, https://nextons.ru/news/, https://kept.ru/news/, https://bgplaw.com/mediahub/, https://t.me/legal_edu, https://t.me/optimalogistic, https://t.me/Compliance_Practice, https://t.me/MaritimeLaw_DianaPodolyan, https://t.me/lawsanctions, https://t.me/allthingslegal, https://t.me/maritime_law_news, https://t.me/denuolaw, https://t.me/tedo_business, https://t.me/povorotnapravo, https://t.me/kept_business, https://t.me/pgp_official, https://t.me/Maritime_law1, https://t.me/alumnipartnerslawfirm, https://t.me/legal1520, https://t.me/maritimearbitration

@@ -396,6 +396,7 @@ def format_digest_response(profile: PromptProfile, rows: list[dict[str, str]], u
             f"status={usage.get('perplexity_seed_status', 'n/a')}, "
             f"sender_messages={usage.get('perplexity_seed_sender_messages', 0)}, "
             f"slot_matched_reports={usage.get('perplexity_seed_profile_messages', 0)}, "
+            f"reports_used={usage.get('perplexity_seed_reports_used', 0)}, "
             f"sender_filter={usage.get('perplexity_seed_sender_filter', 'n/a')}"
         )
     if "followup_plan_status" in usage or "followup_search_status" in usage:

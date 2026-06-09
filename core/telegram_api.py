@@ -1,11 +1,15 @@
+from __future__ import annotations
+
 import asyncio
-import json
 from typing import Optional
-from urllib import error, parse, request
+from urllib.parse import urlencode, urlsplit, urlunsplit
+
+import requests
 
 
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/{method}"
 MAX_TELEGRAM_MESSAGE_LENGTH = 4000
+_TELEGRAM_PROXY_URL = ""
 
 
 def split_message(text: str, limit: int = MAX_TELEGRAM_MESSAGE_LENGTH) -> list[str]:
@@ -33,23 +37,53 @@ def split_message(text: str, limit: int = MAX_TELEGRAM_MESSAGE_LENGTH) -> list[s
     return chunks
 
 
+def configure_telegram_proxy(proxy_url: str) -> None:
+    global _TELEGRAM_PROXY_URL
+    _TELEGRAM_PROXY_URL = (proxy_url or "").strip()
+
+
+def mask_proxy_url(proxy_url: str) -> str:
+    parts = urlsplit(proxy_url)
+    if not parts.netloc or "@" not in parts.netloc:
+        return proxy_url
+
+    _, host_part = parts.netloc.rsplit("@", 1)
+    return urlunsplit((parts.scheme, f"***@{host_part}", parts.path, parts.query, parts.fragment))
+
+
 def tg_request(bot_token: str, method: str, payload: Optional[dict] = None) -> dict:
     url = TELEGRAM_API_URL.format(token=bot_token, method=method)
-    data = None
-    headers = {}
     http_method = "GET"
+    request_kwargs: dict[str, object] = {
+        "method": http_method,
+        "url": url,
+        "timeout": 60,
+    }
     if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json"
         http_method = "POST"
-    req = request.Request(url, data=data, headers=headers, method=http_method)
+        request_kwargs["method"] = http_method
+        request_kwargs["json"] = payload
+    if _TELEGRAM_PROXY_URL:
+        request_kwargs["proxies"] = {"http": _TELEGRAM_PROXY_URL, "https": _TELEGRAM_PROXY_URL}
     try:
-        with request.urlopen(req, timeout=60) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-    except error.HTTPError as exc:
-        details = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Telegram API error {exc.code}: {details}") from exc
-    except error.URLError as exc:
+        response = requests.request(**request_kwargs)
+        response.raise_for_status()
+        body = response.json()
+    except requests.HTTPError as exc:
+        details = ""
+        if exc.response is not None:
+            details = exc.response.text[:1000]
+            status_code = exc.response.status_code
+        else:
+            status_code = "unknown"
+        raise RuntimeError(f"Telegram API error {status_code}: {details}") from exc
+    except requests.InvalidSchema as exc:
+        if _TELEGRAM_PROXY_URL.lower().startswith("socks"):
+            raise RuntimeError(
+                "Telegram SOCKS proxy requires PySocks support. Install dependencies from requirements.txt."
+            ) from exc
+        raise RuntimeError(f"Telegram network error: {exc}") from exc
+    except requests.RequestException as exc:
         raise RuntimeError(f"Telegram network error: {exc}") from exc
     if not body.get("ok"):
         raise RuntimeError(f"Telegram API returned error: {body}")
@@ -60,7 +94,7 @@ async def tg_get_updates(bot_token: str, offset: int | None, timeout: int = 30) 
     params = {"timeout": timeout}
     if offset is not None:
         params["offset"] = offset
-    method = f"getUpdates?{parse.urlencode(params)}"
+    method = f"getUpdates?{urlencode(params)}"
     return await asyncio.to_thread(tg_request, bot_token, method, None)
 
 
