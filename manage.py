@@ -15,7 +15,7 @@ from pipelines.adaptive_followup import (
     plan_followup_queries,
     run_followup_queries,
 )
-from pipelines.engine import format_digest_response, run_budget_pipeline
+from pipelines.engine import format_digest_response, format_digest_response_html, run_budget_pipeline
 from pipelines.models import PromptProfile
 from pipelines.openrouter_filter import DEFAULT_OPENROUTER_MODEL, run_three_stage_openrouter_pipeline
 from pipelines.perplexity_seed import (
@@ -272,7 +272,7 @@ async def handle_prompt_command(
                 profile,
                 tz,
             )
-        await tg_send_text(bot_token, chat_id, result)
+        await tg_send_text(bot_token, chat_id, format_digest_response_html(result), parse_mode="HTML")
     except Exception as exc:
         await tg_send_text(bot_token, chat_id, f"Ошибка при запросе {command}: {exc}")
 

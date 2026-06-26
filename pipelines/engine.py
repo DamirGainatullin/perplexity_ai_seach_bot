@@ -1,6 +1,8 @@
+import re
 import time
 from dataclasses import dataclass
 from datetime import date, timedelta
+from html import escape
 from typing import Any, Optional
 
 from requests import RequestException
@@ -20,6 +22,8 @@ from pipelines.helpers import (
 )
 from pipelines.models import PromptProfile, QueryRule
 from pipelines.telegram_feed import extract_telegram_channels, parse_recent_open_channel_posts
+
+_SECTION_LINE_RE = re.compile(r"^\d+\)\s+")
 
 
 @dataclass
@@ -356,75 +360,28 @@ def format_digest_response(profile: PromptProfile, rows: list[dict[str, str]], u
     else:
         for idx, row in enumerate(rows, start=1):
             lines.append(f"{idx}) {row['category']}")
-            lines.append(f"Заголовок: {row['title']}")
+            lines.append(str(row['title']))
             lines.append(f"Резюме: {row['summary']}")
             lines.append(f"Ссылка: {row['url']}")
             lines.append(f"Дата: {row['date']}")
             lines.append("")
-    lines.append(
-        f"Budget usage (credits): total={usage['total_credits']:.1f} "
-        f"(search={usage['search_credits']:.1f}, extract={usage['extract_credits']:.1f}), "
-        f"target<={usage['target_credits']}"
-    )
-    lines.append(
-        "Telegram sources: "
-        f"channels={usage.get('telegram_channels_total', 0)}, "
-        f"ok={usage.get('telegram_channels_ok', 0)}, "
-        f"posts_added={usage.get('telegram_posts_added', 0)}, "
-        f"errors={usage.get('telegram_errors_count', 0)}"
-    )
-    if "web_items_total" in usage:
-        lines.append(
-            "Web sources: "
-            f"total={usage.get('web_items_total', 0)}, "
-            f"in_week={usage.get('web_items_in_week', 0)}, "
-            f"resolved_date={usage.get('web_items_with_resolved_date', 0)}, "
-            f"no_date={usage.get('web_items_without_date', 0)}, "
-            f"dropped_out_of_week={usage.get('web_items_out_of_week_dropped', 0)}"
-        )
-    if "pre_llm_candidates_total" in usage:
-        lines.append(
-            "Pre-LLM mix: "
-            f"limit={usage.get('pre_llm_limit', 0)}, "
-            f"total={usage.get('pre_llm_candidates_total', 0)}, "
-            f"web={usage.get('pre_llm_candidates_web', 0)}, "
-            f"tg={usage.get('pre_llm_candidates_tg', 0)}"
-        )
-    if "perplexity_seed_status" in usage:
-        lines.append(
-            "Perplexity seed: "
-            f"status={usage.get('perplexity_seed_status', 'n/a')}, "
-            f"sender_messages={usage.get('perplexity_seed_sender_messages', 0)}, "
-            f"slot_matched_reports={usage.get('perplexity_seed_profile_messages', 0)}, "
-            f"reports_used={usage.get('perplexity_seed_reports_used', 0)}, "
-            f"sender_filter={usage.get('perplexity_seed_sender_filter', 'n/a')}"
-        )
-    if "followup_plan_status" in usage or "followup_search_status" in usage:
-        lines.append(
-            "Adaptive follow-up: "
-            f"seed_status={usage.get('perplexity_seed_status', 'n/a')}, "
-            f"plan={usage.get('followup_plan_status', 'n/a')}, "
-            f"queries={usage.get('followup_plan_queries_count', 0)}, "
-            f"runs={usage.get('followup_search_runs_executed', 0)}, "
-            f"rows_added={usage.get('followup_search_rows_added', 0)}, "
-            f"rows_after_merge={usage.get('followup_rows_after_merge', 0)}, "
-            f"final_rows={usage.get('final_rows_count', 0)}, "
-            f"credits={float(usage.get('followup_search_credits', 0.0)):.1f}"
-        )
-    if "openrouter_filter_status" in usage:
-        lines.append(
-            "OpenRouter filter: "
-            f"status={usage.get('openrouter_filter_status')}, "
-            f"input={usage.get('openrouter_filter_input_items', 0)}, "
-            f"output={usage.get('openrouter_filter_output_items', 0)}, "
-            f"removed={usage.get('openrouter_filter_removed_items', 0)}"
-        )
-    if "openrouter_pipeline_status" in usage or "openrouter_stage1_status" in usage:
-        lines.append(
-            "OpenRouter 3-stage: "
-            f"pipeline={usage.get('openrouter_pipeline_status', 'n/a')}, "
-            f"s1={usage.get('openrouter_stage1_status', 'n/a')}, "
-            f"s2={usage.get('openrouter_stage2_status', 'n/a')}, "
-            f"s3={usage.get('openrouter_stage3_status', 'n/a')}"
-        )
     return "\n".join(lines).strip()
+
+
+def format_digest_response_html(text: str) -> str:
+    lines: list[str] = []
+    highlight_next = False
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        if not line:
+            lines.append("")
+            highlight_next = False
+            continue
+        if highlight_next:
+            lines.append(f"<b>{escape(line)}</b>")
+            highlight_next = False
+            continue
+        lines.append(escape(line))
+        if _SECTION_LINE_RE.match(line):
+            highlight_next = True
+    return "\n".join(lines)

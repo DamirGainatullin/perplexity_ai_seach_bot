@@ -99,7 +99,9 @@ async def tg_get_updates(bot_token: str, offset: int | None, timeout: int = 30) 
     return await asyncio.to_thread(tg_request, bot_token, method, None)
 
 
-async def tg_send_text(bot_token: str, chat_id: int, text: str) -> None:
+async def tg_send_text(bot_token: str, chat_id: int, text: str, parse_mode: Optional[str] = None) -> None:
     for chunk in split_message(text):
         payload = {"chat_id": chat_id, "text": chunk, "disable_web_page_preview": True}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         await asyncio.to_thread(tg_request, bot_token, "sendMessage", payload)
