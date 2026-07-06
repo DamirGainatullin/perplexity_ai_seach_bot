@@ -25,6 +25,17 @@ def db_init(db_path: Path) -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS schedule_subscriptions (
+                chat_id INTEGER PRIMARY KEY,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_sent_at TEXT
+            )
+            """
+        )
 
 
 def db_add_chat(db_path: Path, chat_id: int) -> None:
@@ -36,6 +47,66 @@ def db_add_chat(db_path: Path, chat_id: int) -> None:
             ON CONFLICT(chat_id) DO NOTHING
             """,
             (chat_id, datetime.utcnow().isoformat(timespec="seconds")),
+        )
+
+
+def db_toggle_schedule_subscription(db_path: Path, chat_id: int) -> bool:
+    now_iso = datetime.utcnow().isoformat(timespec="seconds")
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT enabled
+            FROM schedule_subscriptions
+            WHERE chat_id = ?
+            """,
+            (chat_id,),
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                """
+                INSERT INTO schedule_subscriptions (chat_id, enabled, created_at, updated_at, last_sent_at)
+                VALUES (?, 1, ?, ?, NULL)
+                """,
+                (chat_id, now_iso, now_iso),
+            )
+            return True
+
+        enabled = 0 if int(row[0] or 0) else 1
+        conn.execute(
+            """
+            UPDATE schedule_subscriptions
+            SET enabled = ?, updated_at = ?
+            WHERE chat_id = ?
+            """,
+            (enabled, now_iso, chat_id),
+        )
+        return bool(enabled)
+
+
+def db_list_due_schedule_chat_ids(db_path: Path, schedule_slot: str) -> list[int]:
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT chat_id
+            FROM schedule_subscriptions
+            WHERE enabled = 1
+              AND (last_sent_at IS NULL OR last_sent_at <> ?)
+            ORDER BY chat_id
+            """,
+            (schedule_slot,),
+        ).fetchall()
+    return [int(row[0]) for row in rows]
+
+
+def db_mark_schedule_sent(db_path: Path, chat_id: int, schedule_slot: str) -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE schedule_subscriptions
+            SET last_sent_at = ?, updated_at = ?
+            WHERE chat_id = ?
+            """,
+            (schedule_slot, datetime.utcnow().isoformat(timespec="seconds"), chat_id),
         )
 
 

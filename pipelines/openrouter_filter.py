@@ -72,7 +72,9 @@ DEFAULT_STAGE2_PROMPT_TEMPLATE = """
 - Не выдумывай факты.
 - Стиль нейтральный, юридически аккуратный.
 - Один summary на один index.
-- Целевая длина summary: 350-900 символов.
+- Целевая длина summary: 220-450 символов.
+- Если фактов много, оставь только самые важные для понимания сути новости.
+- Не растягивай summary вводными фразами и повторениями.
 
 Верни строго JSON:
 {"items":[{"index":1,"summary":"..."}]}
@@ -92,6 +94,7 @@ DEFAULT_STAGE3_PROMPT_TEMPLATE = """
 3) Проставь каждой новости короткую юридическую категорию.
 4) При необходимости переформулируй заголовок и summary для ясности без изменения фактов.
 5) Удали оставшиеся дубли.
+6) Summary должен остаться кратким: обычно 220-450 символов, без повторов и длинных перечислений.
 
 Верни строго JSON:
 {"items":[{"index":1,"category":"...","title":"...","summary":"..."}]}
@@ -549,7 +552,7 @@ def run_three_stage_openrouter_pipeline(
     model: str = DEFAULT_OPENROUTER_MODEL,
     timeout_sec: int = 60,
     prompts_dir: Path | None = None,
-    max_summary_chars: int = 900,
+    max_summary_chars: int = 420,
 ) -> tuple[list[dict[str, str]], dict[str, Any]]:
     if not rows:
         return rows, {

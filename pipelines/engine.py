@@ -24,6 +24,7 @@ from pipelines.models import PromptProfile, QueryRule
 from pipelines.telegram_feed import extract_telegram_channels, parse_recent_open_channel_posts
 
 _SECTION_LINE_RE = re.compile(r"^\d+\)\s+")
+FINAL_SUMMARY_CHAR_LIMIT = 420
 
 
 @dataclass
@@ -40,6 +41,13 @@ def _build_telegram_title(channel: str, text: str, post_id: int) -> str:
     if len(preview) <= 90:
         return f"Telegram @{channel}: {preview}"
     return f"Telegram @{channel}: {preview[:87]}..."
+
+
+def _truncate_summary_for_output(text: str, limit: int = FINAL_SUMMARY_CHAR_LIMIT) -> str:
+    normalized = " ".join(str(text or "").split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: max(0, limit - 3)].rstrip() + "..."
 
 
 def _search_with_retry(client: TavilyClient, payload: dict[str, Any]) -> dict[str, Any]:
@@ -361,7 +369,7 @@ def format_digest_response(profile: PromptProfile, rows: list[dict[str, str]], u
         for idx, row in enumerate(rows, start=1):
             lines.append(f"{idx}) {row['category']}")
             lines.append(str(row['title']))
-            lines.append(f"Резюме: {row['summary']}")
+            lines.append(f"Резюме: {_truncate_summary_for_output(row['summary'])}")
             lines.append(f"Ссылка: {row['url']}")
             lines.append(f"Дата: {row['date']}")
             lines.append("")

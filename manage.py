@@ -4,7 +4,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from core.db import db_add_chat, db_delete_cached_response, db_get_cached_response, db_init, db_save_cached_response
+from core.db import (
+    db_add_chat,
+    db_delete_cached_response,
+    db_get_cached_response,
+    db_init,
+    db_list_due_schedule_chat_ids,
+    db_mark_schedule_sent,
+    db_save_cached_response,
+    db_toggle_schedule_subscription,
+)
 from core.env import load_env, read_text_with_fallback, resolve_timezone
 from core.telegram_api import configure_telegram_proxy, mask_proxy_url, tg_get_updates, tg_send_text
 from pipelines.adaptive_followup import (
@@ -31,6 +40,11 @@ ENV_PATH = BASE_DIR / ".env"
 PROMPTS_DIR = BASE_DIR / "prompts"
 DB_PATH = BASE_DIR / "weekly_bot.sqlite3"
 DEFAULT_TZ = "Europe/Moscow"
+SCHEDULE_COMMAND = "/schedule"
+SCHEDULE_WEEKDAY = 0
+SCHEDULE_HOUR = 8
+SCHEDULE_MINUTE = 30
+SCHEDULE_POLL_INTERVAL_SEC = 30
 CLEAR_TARGET_ALIASES = {
     "logistic": "logistics",
     "logistics": "logistics",
@@ -91,6 +105,12 @@ def _resolve_clear_profile(profiles: dict[str, PromptProfile], command: str) -> 
         if profile.name.lower() == normalized:
             return profile
     return None
+
+
+def _is_schedule_due(now: datetime) -> bool:
+    if now.weekday() != SCHEDULE_WEEKDAY:
+        return False
+    return (now.hour, now.minute) >= (SCHEDULE_HOUR, SCHEDULE_MINUTE)
 
 
 async def generate_by_profile(
@@ -230,7 +250,9 @@ async def generate_by_profile_with_usage(
 
 async def handle_start(bot_token: str, chat_id: int, commands: dict[str, Path]) -> None:
     db_add_chat(DB_PATH, chat_id)
-    cmd_text = ", ".join(sorted(commands.keys())) if commands else "(нет доступных команд)"
+    visible_commands = sorted(commands.keys())
+    visible_commands.append(SCHEDULE_COMMAND)
+    cmd_text = ", ".join(visible_commands) if visible_commands else "(нет доступных команд)"
     text = (
         "Чат зарегистрирован для еженедельной рассылки.\n"
         "Доступные команды:\n"
@@ -297,6 +319,143 @@ async def handle_clear_command(
         await tg_send_text(bot_token, chat_id, f"Кэш за {cache_date} для {profile.name} уже пуст.")
 
 
+async def handle_schedule_command(bot_token: str, chat_id: int) -> None:
+    db_add_chat(DB_PATH, chat_id)
+    enabled = await asyncio.to_thread(db_toggle_schedule_subscription, DB_PATH, chat_id)
+    if enabled:
+        await tg_send_text(
+            bot_token,
+            chat_id,
+            "Авторассылка включена. По понедельникам в 08:30 сюда будут приходить сводки по всем направлениям.",
+        )
+    else:
+        await tg_send_text(
+            bot_token,
+            chat_id,
+            "Авторассылка отключена. Плановые сводки по понедельникам в этот чат больше отправляться не будут.",
+        )
+
+
+async def _build_scheduled_reports(
+    profiles: dict[str, PromptProfile],
+    tavily_api_key: str,
+    openrouter_api_key: str,
+    openrouter_model: str,
+    adaptive_followup_enabled: bool,
+    followup_credit_cap: float,
+    followup_max_queries: int,
+    followup_max_results: int,
+    tz,
+    request_lock: asyncio.Lock,
+) -> list[tuple[str, str, bool]]:
+    reports: list[tuple[str, str, bool]] = []
+    async with request_lock:
+        for command, profile in sorted(profiles.items()):
+            try:
+                result = await generate_by_profile(
+                    tavily_api_key,
+                    openrouter_api_key,
+                    openrouter_model,
+                    adaptive_followup_enabled,
+                    followup_credit_cap,
+                    followup_max_queries,
+                    followup_max_results,
+                    profile,
+                    tz,
+                )
+                reports.append((command, result, True))
+            except Exception as exc:
+                reports.append((command, f"Ошибка при плановой сводке {command}: {exc}", False))
+    return reports
+
+
+async def run_scheduled_broadcast(
+    bot_token: str,
+    chat_ids: list[int],
+    profiles: dict[str, PromptProfile],
+    tavily_api_key: str,
+    openrouter_api_key: str,
+    openrouter_model: str,
+    adaptive_followup_enabled: bool,
+    followup_credit_cap: float,
+    followup_max_queries: int,
+    followup_max_results: int,
+    tz,
+    request_lock: asyncio.Lock,
+    schedule_slot: str,
+) -> None:
+    if not chat_ids:
+        return
+
+    reports = await _build_scheduled_reports(
+        profiles,
+        tavily_api_key,
+        openrouter_api_key,
+        openrouter_model,
+        adaptive_followup_enabled,
+        followup_credit_cap,
+        followup_max_queries,
+        followup_max_results,
+        tz,
+        request_lock,
+    )
+    header = f"Плановая рассылка за {schedule_slot}. Ниже идут сводки по всем направлениям."
+
+    for chat_id in chat_ids:
+        try:
+            await tg_send_text(bot_token, chat_id, header)
+            for _command, text, is_digest in reports:
+                if is_digest:
+                    await tg_send_text(bot_token, chat_id, format_digest_response_html(text), parse_mode="HTML")
+                else:
+                    await tg_send_text(bot_token, chat_id, text)
+            await asyncio.to_thread(db_mark_schedule_sent, DB_PATH, chat_id, schedule_slot)
+        except Exception as exc:
+            print(f"[schedule] failed chat_id={chat_id}: {exc}", file=sys.stderr)
+
+
+async def schedule_loop(
+    bot_token: str,
+    profiles: dict[str, PromptProfile],
+    tavily_api_key: str,
+    openrouter_api_key: str,
+    openrouter_model: str,
+    adaptive_followup_enabled: bool,
+    followup_credit_cap: float,
+    followup_max_queries: int,
+    followup_max_results: int,
+    tz,
+    request_lock: asyncio.Lock,
+) -> None:
+    while True:
+        try:
+            now = datetime.now(tz)
+            if _is_schedule_due(now):
+                schedule_slot = now.date().isoformat()
+                chat_ids = await asyncio.to_thread(db_list_due_schedule_chat_ids, DB_PATH, schedule_slot)
+                if chat_ids:
+                    print(f"[schedule] sending weekly digest to {len(chat_ids)} chat(s) for {schedule_slot}")
+                    await run_scheduled_broadcast(
+                        bot_token,
+                        chat_ids,
+                        profiles,
+                        tavily_api_key,
+                        openrouter_api_key,
+                        openrouter_model,
+                        adaptive_followup_enabled,
+                        followup_credit_cap,
+                        followup_max_queries,
+                        followup_max_results,
+                        tz,
+                        request_lock,
+                        schedule_slot,
+                    )
+            await asyncio.sleep(SCHEDULE_POLL_INTERVAL_SEC)
+        except Exception as exc:
+            print(f"[schedule] {exc}", file=sys.stderr)
+            await asyncio.sleep(SCHEDULE_POLL_INTERVAL_SEC)
+
+
 async def poll_loop(
     bot_token: str,
     profiles: dict[str, PromptProfile],
@@ -328,6 +487,8 @@ async def poll_loop(
                 command = text.split()[0].split("@")[0].lower()
                 if command == "/start":
                     await handle_start(bot_token, chat_id, get_prompt_commands(profiles))
+                elif command == SCHEDULE_COMMAND:
+                    await handle_schedule_command(bot_token, chat_id)
                 elif command.startswith("/clear:"):
                     await handle_clear_command(
                         bot_token,
@@ -414,19 +575,46 @@ async def main() -> None:
         f"max_queries={settings['followup_max_queries']}, "
         f"max_results={settings['followup_max_results']}"
     )
-    await poll_loop(
-        settings["bot_token"],
-        profiles,
-        settings["tavily_api_key"],
-        settings["openrouter_api_key"],
-        settings["openrouter_model"],
-        settings["adaptive_followup_enabled"],
-        settings["followup_credit_cap"],
-        settings["followup_max_queries"],
-        settings["followup_max_results"],
-        settings["tz"],
-        request_lock,
+    print(
+        "[startup] Weekly schedule: "
+        f"enabled via {SCHEDULE_COMMAND}, every Monday at {SCHEDULE_HOUR:02d}:{SCHEDULE_MINUTE:02d}"
     )
+
+    schedule_task = asyncio.create_task(
+        schedule_loop(
+            settings["bot_token"],
+            profiles,
+            settings["tavily_api_key"],
+            settings["openrouter_api_key"],
+            settings["openrouter_model"],
+            settings["adaptive_followup_enabled"],
+            settings["followup_credit_cap"],
+            settings["followup_max_queries"],
+            settings["followup_max_results"],
+            settings["tz"],
+            request_lock,
+        )
+    )
+    try:
+        await poll_loop(
+            settings["bot_token"],
+            profiles,
+            settings["tavily_api_key"],
+            settings["openrouter_api_key"],
+            settings["openrouter_model"],
+            settings["adaptive_followup_enabled"],
+            settings["followup_credit_cap"],
+            settings["followup_max_queries"],
+            settings["followup_max_results"],
+            settings["tz"],
+            request_lock,
+        )
+    finally:
+        schedule_task.cancel()
+        try:
+            await schedule_task
+        except asyncio.CancelledError:
+            pass
 
 
 if __name__ == "__main__":
