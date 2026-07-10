@@ -7,10 +7,15 @@ from typing import Any, Optional
 from core.db import (
     db_add_chat,
     db_delete_cached_response,
-    db_get_cached_response,
+    db_get_cached_result,
+    db_get_recent_digest_history,
     db_init,
     db_list_due_schedule_chat_ids,
     db_mark_schedule_sent,
+    db_prepare_schedule_mode,
+    db_reconcile_tavily_credits,
+    db_reserve_tavily_credits,
+    db_save_digest_history,
     db_save_cached_response,
     db_toggle_schedule_subscription,
 )
@@ -24,6 +29,7 @@ from pipelines.adaptive_followup import (
     plan_followup_queries,
     run_followup_queries,
 )
+from pipelines.daily_engine import DAILY_PROFILE_CREDIT_RESERVATION, run_daily_pipeline
 from pipelines.engine import format_digest_response, format_digest_response_html, run_budget_pipeline
 from pipelines.models import PromptProfile
 from pipelines.openrouter_filter import DEFAULT_OPENROUTER_MODEL, run_three_stage_openrouter_pipeline
@@ -41,10 +47,13 @@ PROMPTS_DIR = BASE_DIR / "prompts"
 DB_PATH = BASE_DIR / "weekly_bot.sqlite3"
 DEFAULT_TZ = "Europe/Moscow"
 SCHEDULE_COMMAND = "/schedule"
-SCHEDULE_WEEKDAY = 0
-SCHEDULE_HOUR = 8
-SCHEDULE_MINUTE = 30
-SCHEDULE_POLL_INTERVAL_SEC = 30
+DEFAULT_DIGEST_MODE = "daily"
+DEFAULT_DAILY_LOOKBACK_DAYS = 2
+DEFAULT_DAILY_TAVILY_CREDIT_LIMIT = 28.0
+DEFAULT_SCHEDULE_WEEKDAY = 0
+DEFAULT_SCHEDULE_HOUR = 8
+DEFAULT_SCHEDULE_MINUTE = 30
+DEFAULT_SCHEDULE_POLL_INTERVAL_SEC = 30
 CLEAR_TARGET_ALIASES = {
     "logistic": "logistics",
     "logistics": "logistics",
@@ -90,6 +99,23 @@ def _safe_float(raw: str | None, default: float) -> float:
         return default
 
 
+def _safe_schedule_time(raw: str | None, default_hour: int, default_minute: int) -> tuple[int, int]:
+    if not raw:
+        return default_hour, default_minute
+    value = raw.strip()
+    if not value or ":" not in value:
+        return default_hour, default_minute
+    hour_raw, minute_raw = value.split(":", 1)
+    try:
+        hour = int(hour_raw)
+        minute = int(minute_raw)
+    except ValueError:
+        return default_hour, default_minute
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return default_hour, default_minute
+    return hour, minute
+
+
 def get_prompt_commands(profiles: dict[str, PromptProfile]) -> dict[str, Path]:
     return {command: profile.prompt_path for command, profile in profiles.items()}
 
@@ -107,10 +133,16 @@ def _resolve_clear_profile(profiles: dict[str, PromptProfile], command: str) -> 
     return None
 
 
-def _is_schedule_due(now: datetime) -> bool:
-    if now.weekday() != SCHEDULE_WEEKDAY:
+def _is_schedule_due(
+    now: datetime,
+    digest_mode: str,
+    schedule_weekday: int,
+    schedule_hour: int,
+    schedule_minute: int,
+) -> bool:
+    if digest_mode == "weekly" and now.weekday() != schedule_weekday:
         return False
-    return (now.hour, now.minute) >= (SCHEDULE_HOUR, SCHEDULE_MINUTE)
+    return (now.hour, now.minute) >= (schedule_hour, schedule_minute)
 
 
 async def generate_by_profile(
@@ -123,6 +155,10 @@ async def generate_by_profile(
     followup_max_results: int,
     profile: PromptProfile,
     tz,
+    *,
+    digest_mode: str = DEFAULT_DIGEST_MODE,
+    daily_lookback_days: int = DEFAULT_DAILY_LOOKBACK_DAYS,
+    daily_tavily_credit_limit: float = DEFAULT_DAILY_TAVILY_CREDIT_LIMIT,
 ) -> str:
     response_text, _usage = await generate_by_profile_with_usage(
         tavily_api_key,
@@ -134,6 +170,9 @@ async def generate_by_profile(
         followup_max_results,
         profile,
         tz,
+        digest_mode=digest_mode,
+        daily_lookback_days=daily_lookback_days,
+        daily_tavily_credit_limit=daily_tavily_credit_limit,
         use_cache=True,
         persist_cache=True,
     )
@@ -151,113 +190,162 @@ async def generate_by_profile_with_usage(
     profile: PromptProfile,
     tz,
     *,
+    digest_mode: str = DEFAULT_DIGEST_MODE,
+    daily_lookback_days: int = DEFAULT_DAILY_LOOKBACK_DAYS,
+    daily_tavily_credit_limit: float = DEFAULT_DAILY_TAVILY_CREDIT_LIMIT,
+    use_history: bool = True,
+    persist_history: bool = True,
     use_cache: bool = True,
     persist_cache: bool = True,
 ) -> tuple[str, dict[str, Any]]:
     prompt_name = profile.name
+    normalized_mode = "weekly" if digest_mode == "weekly" else "daily"
+    cache_prompt_name = prompt_name if normalized_mode == "weekly" else f"{prompt_name}:daily"
     now_date = datetime.now(tz).date()
     cache_date = now_date.isoformat()
     if use_cache:
-        cached = db_get_cached_response(DB_PATH, prompt_name, cache_date)
+        cached = db_get_cached_result(DB_PATH, cache_prompt_name, cache_date)
         if cached is not None:
-            return cached, {
+            cached_response, cached_item_count = cached
+            return cached_response, {
                 "cache_hit": True,
                 "cache_date": cache_date,
                 "prompt_name": prompt_name,
+                "final_rows_count": cached_item_count,
             }
 
     prompt_text = read_text_with_fallback(profile.prompt_path)
-    rows, usage = await asyncio.to_thread(
-        run_budget_pipeline,
-        profile,
-        prompt_text,
-        tavily_api_key,
-        now_date,
-    )
-
-    if adaptive_followup_enabled and is_perplexity_followup_enabled_for_profile(profile.name):
-        seed_summary, seed_meta = await asyncio.to_thread(
-            load_aggregated_perplexity_summary_for_profile,
-            profile.name,
-            PROMPTS_DIR,
-            BASE_DIR,
+    if normalized_mode == "daily":
+        recent_history = (
+            await asyncio.to_thread(
+                db_get_recent_digest_history,
+                DB_PATH,
+                prompt_name,
+                limit=40,
+            )
+            if use_history
+            else []
         )
-        usage.update(seed_meta)
-
-        queries, plan_meta = await asyncio.to_thread(
-            plan_followup_queries,
+        reserved = await asyncio.to_thread(
+            db_reserve_tavily_credits,
+            DB_PATH,
+            cache_date,
+            DAILY_PROFILE_CREDIT_RESERVATION,
+            daily_tavily_credit_limit,
+        )
+        allowance = DAILY_PROFILE_CREDIT_RESERVATION if reserved else 0.0
+        rows, usage = await asyncio.to_thread(
+            run_daily_pipeline,
+            profile,
             prompt_text,
-            seed_summary,
-            rows,
+            tavily_api_key,
             openrouter_api_key,
             openrouter_model,
-            max(1, followup_max_queries),
+            now_date,
+            recent_history,
+            lookback_days=daily_lookback_days,
+            credit_allowance=allowance,
         )
-        usage.update(plan_meta)
-
-        extra_rows, followup_meta = await asyncio.to_thread(
-            run_followup_queries,
+        if reserved:
+            await asyncio.to_thread(
+                db_reconcile_tavily_credits,
+                DB_PATH,
+                cache_date,
+                DAILY_PROFILE_CREDIT_RESERVATION,
+                float(usage.get("total_credits", 0.0) or 0.0),
+            )
+        usage["daily_credit_reservation_status"] = "reserved" if reserved else "daily_limit_reached"
+        usage["empty_message"] = "За прошедшие сутки новых релевантных материалов не найдено."
+        if persist_history and rows:
+            await asyncio.to_thread(db_save_digest_history, DB_PATH, prompt_name, rows)
+    else:
+        rows, usage = await asyncio.to_thread(
+            run_budget_pipeline,
             profile,
+            prompt_text,
             tavily_api_key,
             now_date,
-            queries,
-            max(0.0, followup_credit_cap),
-            max(1, followup_max_results),
         )
-        usage.update(followup_meta)
-        usage["total_credits"] = float(usage.get("total_credits", 0.0)) + float(
-            followup_meta.get("followup_search_credits", 0.0)
-        )
-        if extra_rows:
-            rows = merge_digest_rows(rows, extra_rows, limit=30)
-        usage["followup_rows_after_merge"] = len(rows)
-    elif adaptive_followup_enabled:
-        usage.update(
-            {
-                "perplexity_seed_status": "skipped_profile_disabled",
-                "followup_plan_status": "skipped_profile_disabled",
-                "followup_search_status": "skipped_profile_disabled",
-                "followup_rows_after_merge": len(rows),
-            }
-        )
-    else:
-        usage.update(
-            {
-                "perplexity_seed_status": "skipped_globally_disabled",
-                "followup_plan_status": "skipped_globally_disabled",
-                "followup_search_status": "skipped_globally_disabled",
-                "followup_rows_after_merge": len(rows),
-            }
-        )
+        if adaptive_followup_enabled and is_perplexity_followup_enabled_for_profile(profile.name):
+            seed_summary, seed_meta = await asyncio.to_thread(
+                load_aggregated_perplexity_summary_for_profile,
+                profile.name,
+                PROMPTS_DIR,
+                BASE_DIR,
+            )
+            usage.update(seed_meta)
+            queries, plan_meta = await asyncio.to_thread(
+                plan_followup_queries,
+                prompt_text,
+                seed_summary,
+                rows,
+                openrouter_api_key,
+                openrouter_model,
+                max(1, followup_max_queries),
+            )
+            usage.update(plan_meta)
+            extra_rows, followup_meta = await asyncio.to_thread(
+                run_followup_queries,
+                profile,
+                tavily_api_key,
+                now_date,
+                queries,
+                max(0.0, followup_credit_cap),
+                max(1, followup_max_results),
+            )
+            usage.update(followup_meta)
+            usage["total_credits"] = float(usage.get("total_credits", 0.0)) + float(
+                followup_meta.get("followup_search_credits", 0.0)
+            )
+            if extra_rows:
+                rows = merge_digest_rows(rows, extra_rows, limit=30)
+            usage["followup_rows_after_merge"] = len(rows)
+        elif adaptive_followup_enabled:
+            usage.update(
+                {
+                    "perplexity_seed_status": "skipped_profile_disabled",
+                    "followup_plan_status": "skipped_profile_disabled",
+                    "followup_search_status": "skipped_profile_disabled",
+                    "followup_rows_after_merge": len(rows),
+                }
+            )
+        else:
+            usage.update(
+                {
+                    "perplexity_seed_status": "skipped_globally_disabled",
+                    "followup_plan_status": "skipped_globally_disabled",
+                    "followup_search_status": "skipped_globally_disabled",
+                    "followup_rows_after_merge": len(rows),
+                }
+            )
 
-    rows, filter_usage = await asyncio.to_thread(
-        run_three_stage_openrouter_pipeline,
-        rows,
-        prompt_text,
-        openrouter_api_key,
-        openrouter_model,
-    )
-    usage.update(filter_usage)
+        rows, filter_usage = await asyncio.to_thread(
+            run_three_stage_openrouter_pipeline,
+            rows,
+            prompt_text,
+            openrouter_api_key,
+            openrouter_model,
+        )
+        usage.update(filter_usage)
+
     usage["final_rows_count"] = len(rows)
+    usage["digest_mode"] = normalized_mode
     usage["cache_hit"] = False
     usage["cache_date"] = cache_date
     usage["prompt_name"] = prompt_name
     response_text = format_digest_response(profile, rows, usage)
     if persist_cache:
-        db_save_cached_response(DB_PATH, prompt_name, cache_date, response_text)
+        db_save_cached_response(DB_PATH, cache_prompt_name, cache_date, response_text, len(rows))
     return response_text, usage
 
 
-async def handle_start(bot_token: str, chat_id: int, commands: dict[str, Path]) -> None:
+async def handle_start(bot_token: str, chat_id: int, commands: dict[str, Path], digest_mode: str) -> None:
     db_add_chat(DB_PATH, chat_id)
     visible_commands = sorted(commands.keys())
     visible_commands.append(SCHEDULE_COMMAND)
     cmd_text = ", ".join(visible_commands) if visible_commands else "(нет доступных команд)"
-    text = (
-        "Чат зарегистрирован для еженедельной рассылки.\n"
-        "Доступные команды:\n"
-        f"{cmd_text}"
-    )
+    period = "ежедневную" if digest_mode == "daily" else "еженедельную"
+    text = f"Бот готов. Авторассылку можно включить командой /schedule ({period}).\nДоступные команды:\n{cmd_text}"
     await tg_send_text(bot_token, chat_id, text)
 
 
@@ -274,6 +362,9 @@ async def handle_prompt_command(
     followup_max_queries: int,
     followup_max_results: int,
     tz,
+    digest_mode: str,
+    daily_lookback_days: int,
+    daily_tavily_credit_limit: float,
     request_lock: asyncio.Lock,
 ) -> None:
     profile = profiles.get(command)
@@ -293,6 +384,9 @@ async def handle_prompt_command(
                 followup_max_results,
                 profile,
                 tz,
+                digest_mode=digest_mode,
+                daily_lookback_days=daily_lookback_days,
+                daily_tavily_credit_limit=daily_tavily_credit_limit,
             )
         await tg_send_text(bot_token, chat_id, format_digest_response_html(result), parse_mode="HTML")
     except Exception as exc:
@@ -305,34 +399,56 @@ async def handle_clear_command(
     command: str,
     profiles: dict[str, PromptProfile],
     tz,
+    digest_mode: str,
     request_lock: asyncio.Lock,
 ) -> None:
     profile = _resolve_clear_profile(profiles, command)
     if profile is None:
         return
     cache_date = datetime.now(tz).date().isoformat()
+    cache_prompt_name = profile.name if digest_mode == "weekly" else f"{profile.name}:daily"
     async with request_lock:
-        deleted = await asyncio.to_thread(db_delete_cached_response, DB_PATH, profile.name, cache_date)
+        deleted = await asyncio.to_thread(db_delete_cached_response, DB_PATH, cache_prompt_name, cache_date)
     if deleted > 0:
         await tg_send_text(bot_token, chat_id, f"Кэш за {cache_date} для {profile.name} очищен.")
     else:
         await tg_send_text(bot_token, chat_id, f"Кэш за {cache_date} для {profile.name} уже пуст.")
 
 
-async def handle_schedule_command(bot_token: str, chat_id: int) -> None:
+async def handle_schedule_command(
+    bot_token: str,
+    chat_id: int,
+    digest_mode: str,
+    tz,
+    schedule_weekday: int,
+    schedule_hour: int,
+    schedule_minute: int,
+) -> None:
     db_add_chat(DB_PATH, chat_id)
-    enabled = await asyncio.to_thread(db_toggle_schedule_subscription, DB_PATH, chat_id)
+    now = datetime.now(tz)
+    elapsed_slot = (
+        now.date().isoformat()
+        if _is_schedule_due(now, digest_mode, schedule_weekday, schedule_hour, schedule_minute)
+        else None
+    )
+    enabled = await asyncio.to_thread(
+        db_toggle_schedule_subscription,
+        DB_PATH,
+        chat_id,
+        initial_last_sent_at=elapsed_slot,
+    )
     if enabled:
+        period = "Ежедневные" if digest_mode == "daily" else "Еженедельные"
         await tg_send_text(
             bot_token,
             chat_id,
-            "Авторассылка включена. По понедельникам в 08:30 сюда будут приходить сводки по всем направлениям.",
+            f"Авторассылка включена. {period} сводки по всем направлениям будут приходить сюда по расписанию сервера.",
         )
     else:
         await tg_send_text(
             bot_token,
             chat_id,
-            "Авторассылка отключена. Плановые сводки по понедельникам в этот чат больше отправляться не будут.",
+            "Авторассылка отключена. Плановые сводки в этот чат больше отправляться не будут.",
         )
 
 
@@ -346,13 +462,16 @@ async def _build_scheduled_reports(
     followup_max_queries: int,
     followup_max_results: int,
     tz,
+    digest_mode: str,
+    daily_lookback_days: int,
+    daily_tavily_credit_limit: float,
     request_lock: asyncio.Lock,
-) -> list[tuple[str, str, bool]]:
-    reports: list[tuple[str, str, bool]] = []
-    async with request_lock:
-        for command, profile in sorted(profiles.items()):
-            try:
-                result = await generate_by_profile(
+) -> list[tuple[str, str, bool, int]]:
+    reports: list[tuple[str, str, bool, int]] = []
+    for command, profile in sorted(profiles.items()):
+        try:
+            async with request_lock:
+                result, usage = await generate_by_profile_with_usage(
                     tavily_api_key,
                     openrouter_api_key,
                     openrouter_model,
@@ -362,10 +481,13 @@ async def _build_scheduled_reports(
                     followup_max_results,
                     profile,
                     tz,
+                    digest_mode=digest_mode,
+                    daily_lookback_days=daily_lookback_days,
+                    daily_tavily_credit_limit=daily_tavily_credit_limit,
                 )
-                reports.append((command, result, True))
-            except Exception as exc:
-                reports.append((command, f"Ошибка при плановой сводке {command}: {exc}", False))
+            reports.append((command, result, True, int(usage.get("final_rows_count", -1))))
+        except Exception as exc:
+            reports.append((command, f"Ошибка при плановой сводке {command}: {exc}", False, -1))
     return reports
 
 
@@ -381,6 +503,9 @@ async def run_scheduled_broadcast(
     followup_max_queries: int,
     followup_max_results: int,
     tz,
+    digest_mode: str,
+    daily_lookback_days: int,
+    daily_tavily_credit_limit: float,
     request_lock: asyncio.Lock,
     schedule_slot: str,
 ) -> None:
@@ -397,18 +522,33 @@ async def run_scheduled_broadcast(
         followup_max_queries,
         followup_max_results,
         tz,
+        digest_mode,
+        daily_lookback_days,
+        daily_tavily_credit_limit,
         request_lock,
     )
-    header = f"Плановая рассылка за {schedule_slot}. Ниже идут сводки по всем направлениям."
+    nonempty_reports = [report for report in reports if (not report[2]) or report[3] != 0]
 
     for chat_id in chat_ids:
         try:
-            await tg_send_text(bot_token, chat_id, header)
-            for _command, text, is_digest in reports:
-                if is_digest:
-                    await tg_send_text(bot_token, chat_id, format_digest_response_html(text), parse_mode="HTML")
-                else:
-                    await tg_send_text(bot_token, chat_id, text)
+            if nonempty_reports:
+                await tg_send_text(bot_token, chat_id, f"Плановая рассылка за {schedule_slot}.")
+                for _command, text, is_digest, _item_count in nonempty_reports:
+                    if is_digest:
+                        await tg_send_text(bot_token, chat_id, format_digest_response_html(text), parse_mode="HTML")
+                    else:
+                        await tg_send_text(bot_token, chat_id, text)
+            else:
+                empty_text = (
+                    "За прошедшие сутки новых релевантных материалов по всем направлениям не найдено."
+                    if digest_mode == "daily"
+                    else "За последние семь дней новых релевантных материалов по всем направлениям не найдено."
+                )
+                await tg_send_text(
+                    bot_token,
+                    chat_id,
+                    empty_text,
+                )
             await asyncio.to_thread(db_mark_schedule_sent, DB_PATH, chat_id, schedule_slot)
         except Exception as exc:
             print(f"[schedule] failed chat_id={chat_id}: {exc}", file=sys.stderr)
@@ -425,16 +565,23 @@ async def schedule_loop(
     followup_max_queries: int,
     followup_max_results: int,
     tz,
+    digest_mode: str,
+    daily_lookback_days: int,
+    daily_tavily_credit_limit: float,
+    schedule_weekday: int,
+    schedule_hour: int,
+    schedule_minute: int,
+    schedule_poll_interval_sec: int,
     request_lock: asyncio.Lock,
 ) -> None:
     while True:
         try:
             now = datetime.now(tz)
-            if _is_schedule_due(now):
+            if _is_schedule_due(now, digest_mode, schedule_weekday, schedule_hour, schedule_minute):
                 schedule_slot = now.date().isoformat()
                 chat_ids = await asyncio.to_thread(db_list_due_schedule_chat_ids, DB_PATH, schedule_slot)
                 if chat_ids:
-                    print(f"[schedule] sending weekly digest to {len(chat_ids)} chat(s) for {schedule_slot}")
+                    print(f"[schedule] sending {digest_mode} digest to {len(chat_ids)} chat(s) for {schedule_slot}")
                     await run_scheduled_broadcast(
                         bot_token,
                         chat_ids,
@@ -447,13 +594,16 @@ async def schedule_loop(
                         followup_max_queries,
                         followup_max_results,
                         tz,
+                        digest_mode,
+                        daily_lookback_days,
+                        daily_tavily_credit_limit,
                         request_lock,
                         schedule_slot,
                     )
-            await asyncio.sleep(SCHEDULE_POLL_INTERVAL_SEC)
+            await asyncio.sleep(schedule_poll_interval_sec)
         except Exception as exc:
             print(f"[schedule] {exc}", file=sys.stderr)
-            await asyncio.sleep(SCHEDULE_POLL_INTERVAL_SEC)
+            await asyncio.sleep(schedule_poll_interval_sec)
 
 
 async def poll_loop(
@@ -467,6 +617,12 @@ async def poll_loop(
     followup_max_queries: int,
     followup_max_results: int,
     tz,
+    digest_mode: str,
+    daily_lookback_days: int,
+    daily_tavily_credit_limit: float,
+    schedule_weekday: int,
+    schedule_hour: int,
+    schedule_minute: int,
     request_lock: asyncio.Lock,
 ) -> None:
     offset: Optional[int] = None
@@ -486,9 +642,17 @@ async def poll_loop(
 
                 command = text.split()[0].split("@")[0].lower()
                 if command == "/start":
-                    await handle_start(bot_token, chat_id, get_prompt_commands(profiles))
+                    await handle_start(bot_token, chat_id, get_prompt_commands(profiles), digest_mode)
                 elif command == SCHEDULE_COMMAND:
-                    await handle_schedule_command(bot_token, chat_id)
+                    await handle_schedule_command(
+                        bot_token,
+                        chat_id,
+                        digest_mode,
+                        tz,
+                        schedule_weekday,
+                        schedule_hour,
+                        schedule_minute,
+                    )
                 elif command.startswith("/clear:"):
                     await handle_clear_command(
                         bot_token,
@@ -496,6 +660,7 @@ async def poll_loop(
                         command,
                         profiles,
                         tz,
+                        digest_mode,
                         request_lock,
                     )
                 elif command in profiles:
@@ -512,6 +677,9 @@ async def poll_loop(
                         followup_max_queries,
                         followup_max_results,
                         tz,
+                        digest_mode,
+                        daily_lookback_days,
+                        daily_tavily_credit_limit,
                         request_lock,
                     )
         except Exception as exc:
@@ -525,17 +693,47 @@ def load_settings() -> dict[str, Any]:
     tavily_api_key = env.get("TAVILY_API_KEY", "")
     if not bot_token or not tavily_api_key:
         raise RuntimeError("BOT_TOKEN and TAVILY_API_KEY must exist in .env")
+    digest_mode = env.get("DIGEST_MODE", DEFAULT_DIGEST_MODE).strip().lower()
+    if digest_mode not in {"daily", "weekly"}:
+        digest_mode = DEFAULT_DIGEST_MODE
     openrouter_api_key = env.get("OPENROUTER_API_KEY", "").strip()
+    if digest_mode == "daily" and not openrouter_api_key:
+        raise RuntimeError("OPENROUTER_API_KEY must exist in .env when DIGEST_MODE=daily")
     openrouter_model = env.get("OPENROUTER_MODEL", DEFAULT_OPENROUTER_MODEL).strip() or DEFAULT_OPENROUTER_MODEL
+    if openrouter_model != DEFAULT_OPENROUTER_MODEL:
+        raise RuntimeError(
+            f"Unsupported OPENROUTER_MODEL={openrouter_model!r}; expected {DEFAULT_OPENROUTER_MODEL!r}"
+        )
     adaptive_followup_enabled = _safe_bool(env.get("ADAPTIVE_FOLLOWUP_ENABLED"), True)
     followup_credit_cap = max(0.0, _safe_float(env.get("FOLLOWUP_CREDIT_CAP"), DEFAULT_FOLLOWUP_CREDIT_CAP))
     followup_max_queries = max(1, _safe_int(env.get("FOLLOWUP_MAX_QUERIES"), DEFAULT_FOLLOWUP_MAX_QUERIES))
     followup_max_results = max(1, _safe_int(env.get("FOLLOWUP_MAX_RESULTS"), DEFAULT_FOLLOWUP_MAX_RESULTS))
     telegram_proxy_url = env.get("TELEGRAM_PROXY_URL", "").strip()
+    schedule_weekday = _safe_int(env.get("SCHEDULE_WEEKDAY"), DEFAULT_SCHEDULE_WEEKDAY)
+    if schedule_weekday < 0 or schedule_weekday > 6:
+        schedule_weekday = DEFAULT_SCHEDULE_WEEKDAY
+    schedule_hour, schedule_minute = _safe_schedule_time(
+        env.get("SCHEDULE_TIME"),
+        DEFAULT_SCHEDULE_HOUR,
+        DEFAULT_SCHEDULE_MINUTE,
+    )
+    schedule_poll_interval_sec = max(
+        5,
+        _safe_int(env.get("SCHEDULE_POLL_INTERVAL_SEC"), DEFAULT_SCHEDULE_POLL_INTERVAL_SEC),
+    )
+    daily_lookback_days = max(
+        1,
+        min(3, _safe_int(env.get("DAILY_LOOKBACK_DAYS"), DEFAULT_DAILY_LOOKBACK_DAYS)),
+    )
+    daily_tavily_credit_limit = max(
+        DAILY_PROFILE_CREDIT_RESERVATION,
+        _safe_float(env.get("DAILY_TAVILY_CREDIT_LIMIT"), DEFAULT_DAILY_TAVILY_CREDIT_LIMIT),
+    )
 
     tz = resolve_timezone(env.get("TZ", DEFAULT_TZ))
     return {
         "bot_token": bot_token,
+        "digest_mode": digest_mode,
         "tavily_api_key": tavily_api_key,
         "openrouter_api_key": openrouter_api_key,
         "openrouter_model": openrouter_model,
@@ -544,6 +742,12 @@ def load_settings() -> dict[str, Any]:
         "followup_max_queries": followup_max_queries,
         "followup_max_results": followup_max_results,
         "telegram_proxy_url": telegram_proxy_url,
+        "schedule_weekday": schedule_weekday,
+        "schedule_hour": schedule_hour,
+        "schedule_minute": schedule_minute,
+        "schedule_poll_interval_sec": schedule_poll_interval_sec,
+        "daily_lookback_days": daily_lookback_days,
+        "daily_tavily_credit_limit": daily_tavily_credit_limit,
         "tz": tz,
     }
 
@@ -557,9 +761,37 @@ async def main() -> None:
     configure_telegram_proxy(settings["telegram_proxy_url"])
     configure_telegram_feed_proxy(settings["telegram_proxy_url"])
     db_init(DB_PATH)
+    startup_now = datetime.now(settings["tz"])
+    elapsed_slot = (
+        startup_now.date().isoformat()
+        if _is_schedule_due(
+            startup_now,
+            settings["digest_mode"],
+            settings["schedule_weekday"],
+            settings["schedule_hour"],
+            settings["schedule_minute"],
+        )
+        else None
+    )
+    previous_mode, skipped_chats = db_prepare_schedule_mode(
+        DB_PATH,
+        settings["digest_mode"],
+        elapsed_schedule_slot=elapsed_slot,
+    )
     request_lock = asyncio.Lock()
 
     print(f"[startup] Prompt commands: {', '.join(sorted(profiles.keys()))}")
+    print(
+        "[startup] Digest mode: "
+        f"{settings['digest_mode']}, daily_lookback_days={settings['daily_lookback_days']}, "
+        f"daily_tavily_credit_limit={settings['daily_tavily_credit_limit']}"
+    )
+    if previous_mode != settings["digest_mode"]:
+        print(
+            "[startup] Digest mode transition: "
+            f"{previous_mode or 'uninitialized'} -> {settings['digest_mode']}, "
+            f"current_slot_skipped_for_chats={skipped_chats}"
+        )
     print(
         "[startup] Telegram proxy: "
         + (mask_proxy_url(settings["telegram_proxy_url"]) if settings["telegram_proxy_url"] else "disabled")
@@ -569,15 +801,17 @@ async def main() -> None:
         + ("enabled" if settings["openrouter_api_key"] else "disabled (OPENROUTER_API_KEY missing)")
     )
     print(
-        "[startup] Adaptive follow-up: "
+        "[startup] Weekly Perplexity follow-up: "
         f"{'enabled' if settings['adaptive_followup_enabled'] else 'disabled'}, "
         f"credit_cap={settings['followup_credit_cap']}, "
         f"max_queries={settings['followup_max_queries']}, "
         f"max_results={settings['followup_max_results']}"
     )
     print(
-        "[startup] Weekly schedule: "
-        f"enabled via {SCHEDULE_COMMAND}, every Monday at {SCHEDULE_HOUR:02d}:{SCHEDULE_MINUTE:02d}"
+        "[startup] Schedule: "
+        f"mode={settings['digest_mode']}, enabled via {SCHEDULE_COMMAND}, weekday={settings['schedule_weekday']}, "
+        f"time={settings['schedule_hour']:02d}:{settings['schedule_minute']:02d}, "
+        f"poll_interval={settings['schedule_poll_interval_sec']}s"
     )
 
     schedule_task = asyncio.create_task(
@@ -592,6 +826,13 @@ async def main() -> None:
             settings["followup_max_queries"],
             settings["followup_max_results"],
             settings["tz"],
+            settings["digest_mode"],
+            settings["daily_lookback_days"],
+            settings["daily_tavily_credit_limit"],
+            settings["schedule_weekday"],
+            settings["schedule_hour"],
+            settings["schedule_minute"],
+            settings["schedule_poll_interval_sec"],
             request_lock,
         )
     )
@@ -607,6 +848,12 @@ async def main() -> None:
             settings["followup_max_queries"],
             settings["followup_max_results"],
             settings["tz"],
+            settings["digest_mode"],
+            settings["daily_lookback_days"],
+            settings["daily_tavily_credit_limit"],
+            settings["schedule_weekday"],
+            settings["schedule_hour"],
+            settings["schedule_minute"],
             request_lock,
         )
     finally:

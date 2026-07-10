@@ -20,6 +20,8 @@ LEGACY_PROMPT_FILE = "legacy_filter.txt"
 STAGE1_PROMPT_FILE = "stage1_filter_dedup.txt"
 STAGE2_PROMPT_FILE = "stage2_summarize.txt"
 STAGE3_PROMPT_FILE = "stage3_finalize.txt"
+DAILY_STAGE1_PROMPT_FILE = "daily_stage1_filter_followup.txt"
+DAILY_STAGE3_PROMPT_FILE = "daily_stage3_finalize.txt"
 
 DEFAULT_LEGACY_PROMPT_TEMPLATE = """
 Ты фильтр релевантности для юридической новостной сводки.
@@ -105,6 +107,43 @@ PROFILE_TOPIC_SPEC:
 {{PROFILE_PROMPT}}
 """.strip()
 
+DEFAULT_DAILY_STAGE1_PROMPT_TEMPLATE = """
+Ты этап 1 ежедневного редакционного контура юридической сводки.
+Отфильтруй материалы по PROFILE_TOPIC_SPEC, удали дубли и при наличии конкретного
+свежего информационного повода составь ровно один уточняющий поисковый запрос.
+Оставь максимум 12 наиболее значимых материалов.
+
+Не оставляй материалы, если из текста явно следует, что публикация старая. Дата
+будущего вступления нормы в силу не является датой публикации. Не пересказывай тексты.
+Уточняющий запрос должен быть на русском языке, относиться к России, содержать предмет
+события, ведомство или номер документа, если они известны. Не используй операторы site:
+и не ограничивай запрос доменами. Если конкретного повода нет, верни null.
+
+Верни строго JSON без markdown:
+{"keep_indices":[1,2],"followup_query":"... или null"}
+
+PROFILE_TOPIC_SPEC:
+{{PROFILE_PROMPT}}
+""".strip()
+
+DEFAULT_DAILY_STAGE3_PROMPT_TEMPLATE = """
+Ты этап 3 ежедневного редакционного контура юридической сводки.
+Выполни финальную проверку релевантности PROFILE_TOPIC_SPEC, подготовь категории,
+заголовки и резюме. Удали дубли внутри materials и смысловые повторы событий из
+recently_sent, даже если ссылки различаются. Не удаляй реальное продолжение события,
+если появились новые юридически значимые факты.
+
+Материал со старой подтверждённой датой не оставляй. Если date пустая, оцени свежесть
+только по фактам исходного текста и ничего не выдумывай. Summary: 220-450 символов.
+
+Верни строго JSON:
+{"items":[{"index":1,"category":"...","title":"...","summary":"..."}]}
+Если оставлять нечего, верни {"items":[]}.
+
+PROFILE_TOPIC_SPEC:
+{{PROFILE_PROMPT}}
+""".strip()
+
 
 def _compact_prompt(prompt_text: str, max_len: int = 7000) -> str:
     compact = " ".join((prompt_text or "").split())
@@ -175,6 +214,22 @@ def _build_material_payload(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
                 "title": _normalize_text(row.get("title", ""), 400),
                 "summary": _normalize_text(row.get("summary", ""), 1500),
                 "content": _normalize_text(row.get("content", row.get("summary", "")), 3000),
+                "url": str(row.get("url", "")).strip(),
+                "date": str(row.get("date", "")).strip(),
+                "date_confidence": str(row.get("date_confidence", "")).strip(),
+                "source": str(row.get("source", "")).strip(),
+            }
+        )
+    return payload
+
+
+def _build_history_payload(rows: list[dict[str, str]], limit: int = 40) -> list[dict[str, str]]:
+    payload: list[dict[str, str]] = []
+    for row in rows[:limit]:
+        payload.append(
+            {
+                "title": _normalize_text(row.get("title", ""), 300),
+                "summary": _normalize_text(row.get("summary", ""), 350),
                 "url": str(row.get("url", "")).strip(),
                 "date": str(row.get("date", "")).strip(),
             }
@@ -405,6 +460,7 @@ def _stage2_summarize_rows(
     timeout_sec: int,
     prompts_dir: Path,
     max_summary_chars: int,
+    max_tokens: int = 2200,
 ) -> tuple[list[dict[str, str]], dict[str, Any]]:
     if not rows:
         return rows, {"openrouter_stage2_status": "skipped_empty"}
@@ -421,7 +477,7 @@ def _stage2_summarize_rows(
         },
         openrouter_api_key=openrouter_api_key,
         model=model,
-        max_tokens=2200,
+        max_tokens=max_tokens,
         timeout_sec=timeout_sec,
     )
     if status != "ok" or parsed is None:
@@ -543,6 +599,229 @@ def _stage3_finalize_rows(
         "openrouter_stage3_prompt_tokens": (usage or {}).get("prompt_tokens", 0),
         "openrouter_stage3_completion_tokens": (usage or {}).get("completion_tokens", 0),
     }
+
+
+def run_daily_stage1_openrouter(
+    rows: list[dict[str, str]],
+    prompt_text: str,
+    recent_history: list[dict[str, str]],
+    openrouter_api_key: str,
+    model: str = DEFAULT_OPENROUTER_MODEL,
+    timeout_sec: int = 60,
+    prompts_dir: Path | None = None,
+) -> tuple[list[dict[str, str]], str, dict[str, Any]]:
+    if not rows:
+        return [], "", {"openrouter_stage1_status": "skipped_empty"}
+    if not openrouter_api_key:
+        return [], "", {"openrouter_stage1_status": "error_no_key"}
+
+    resolved_prompts_dir = prompts_dir or DEFAULT_PROMPTS_DIR
+    template, prompt_path = _resolve_prompt_template(
+        resolved_prompts_dir,
+        DAILY_STAGE1_PROMPT_FILE,
+        DEFAULT_DAILY_STAGE1_PROMPT_TEMPLATE,
+    )
+    parsed, usage, status = _call_openrouter_json(
+        system_prompt=_render_template(template, prompt_text),
+        user_payload={
+            "materials": _build_material_payload(rows),
+            "recently_sent": _build_history_payload(recent_history),
+            "task": "filter daily materials, remove duplicates, and optionally create one follow-up query",
+            "schema": {"keep_indices": [1, 2], "followup_query": "string or null"},
+        },
+        openrouter_api_key=openrouter_api_key,
+        model=model,
+        max_tokens=1100,
+        timeout_sec=timeout_sec,
+    )
+    if status != "ok" or parsed is None:
+        return [], "", {
+            "openrouter_stage1_status": status,
+            "openrouter_stage1_prompt_file": prompt_path,
+        }
+
+    keep_raw = parsed.get("keep_indices")
+    if not isinstance(keep_raw, list):
+        return [], "", {
+            "openrouter_stage1_status": "error_invalid_schema",
+            "openrouter_stage1_prompt_file": prompt_path,
+        }
+
+    keep_indices: list[int] = []
+    seen: set[int] = set()
+    for value in keep_raw:
+        try:
+            idx = int(value)
+        except (TypeError, ValueError):
+            continue
+        if idx < 1 or idx > len(rows) or idx in seen:
+            continue
+        seen.add(idx)
+        keep_indices.append(idx)
+    keep_indices.sort()
+    keep_indices = keep_indices[:12]
+
+    raw_query = parsed.get("followup_query")
+    followup_query = _normalize_text(raw_query, 390).strip() if isinstance(raw_query, str) else ""
+    followup_query = " ".join(re.sub(r"\bsite:\S+", " ", followup_query, flags=re.IGNORECASE).split())
+    if followup_query.lower() in {"null", "none", "нет", "не требуется"}:
+        followup_query = ""
+
+    filtered = [rows[idx - 1] for idx in keep_indices]
+    return filtered, followup_query, {
+        "openrouter_stage1_status": "ok",
+        "openrouter_stage1_prompt_file": prompt_path,
+        "openrouter_stage1_input_items": len(rows),
+        "openrouter_stage1_output_items": len(filtered),
+        "openrouter_stage1_removed_items": len(rows) - len(filtered),
+        "openrouter_stage1_keep_indices": keep_indices,
+        "openrouter_stage1_followup_query": followup_query,
+        "openrouter_stage1_prompt_tokens": (usage or {}).get("prompt_tokens", 0),
+        "openrouter_stage1_completion_tokens": (usage or {}).get("completion_tokens", 0),
+    }
+
+
+def _daily_stage3_finalize_rows(
+    rows: list[dict[str, str]],
+    prompt_text: str,
+    recent_history: list[dict[str, str]],
+    openrouter_api_key: str,
+    model: str,
+    timeout_sec: int,
+    prompts_dir: Path,
+    max_summary_chars: int,
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    if not rows:
+        return [], {"openrouter_stage3_status": "skipped_empty"}
+
+    template, prompt_path = _resolve_prompt_template(
+        prompts_dir,
+        DAILY_STAGE3_PROMPT_FILE,
+        DEFAULT_DAILY_STAGE3_PROMPT_TEMPLATE,
+    )
+    parsed, usage, status = _call_openrouter_json(
+        system_prompt=_render_template(template, prompt_text),
+        user_payload={
+            "materials": _build_material_payload(rows),
+            "recently_sent": _build_history_payload(recent_history),
+            "task": "final daily relevance check, historical deduplication, categorization, and formatting",
+            "schema": {"items": [{"index": 1, "category": "...", "title": "...", "summary": "..."}]},
+        },
+        openrouter_api_key=openrouter_api_key,
+        model=model,
+        max_tokens=2600,
+        timeout_sec=timeout_sec,
+    )
+    if status != "ok" or parsed is None:
+        return rows, {
+            "openrouter_stage3_status": status,
+            "openrouter_stage3_prompt_file": prompt_path,
+        }
+
+    items_raw = parsed.get("items")
+    if not isinstance(items_raw, list):
+        return rows, {
+            "openrouter_stage3_status": "error_invalid_schema",
+            "openrouter_stage3_prompt_file": prompt_path,
+        }
+
+    final_rows: list[dict[str, str]] = []
+    seen_indices: set[int] = set()
+    for item in items_raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            idx = int(item.get("index"))
+        except (TypeError, ValueError):
+            continue
+        if idx < 1 or idx > len(rows) or idx in seen_indices:
+            continue
+        seen_indices.add(idx)
+        base = dict(rows[idx - 1])
+        category = _normalize_text(item.get("category", ""), 160).strip()
+        title = _normalize_text(item.get("title", ""), 260).strip()
+        summary = _normalize_text(item.get("summary", ""), max_summary_chars).strip()
+        if category:
+            base["category"] = category
+        if title:
+            base["title"] = title
+        if summary:
+            base["summary"] = summary
+        final_rows.append(base)
+
+    return final_rows, {
+        "openrouter_stage3_status": "ok",
+        "openrouter_stage3_prompt_file": prompt_path,
+        "openrouter_stage3_input_items": len(rows),
+        "openrouter_stage3_output_items": len(final_rows),
+        "openrouter_stage3_removed_items": len(rows) - len(final_rows),
+        "openrouter_stage3_prompt_tokens": (usage or {}).get("prompt_tokens", 0),
+        "openrouter_stage3_completion_tokens": (usage or {}).get("completion_tokens", 0),
+    }
+
+
+def run_daily_stage2_stage3_openrouter(
+    rows: list[dict[str, str]],
+    prompt_text: str,
+    recent_history: list[dict[str, str]],
+    openrouter_api_key: str,
+    model: str = DEFAULT_OPENROUTER_MODEL,
+    timeout_sec: int = 60,
+    prompts_dir: Path | None = None,
+    max_summary_chars: int = 420,
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    if not rows:
+        return [], {
+            "openrouter_pipeline_mode": "daily_three_stage",
+            "openrouter_pipeline_status": "skipped_empty",
+        }
+    if not openrouter_api_key:
+        return [], {
+            "openrouter_pipeline_mode": "daily_three_stage",
+            "openrouter_pipeline_status": "error_no_key",
+        }
+
+    resolved_prompts_dir = prompts_dir or DEFAULT_PROMPTS_DIR
+    stage2_rows, stage2_usage = _stage2_summarize_rows(
+        rows,
+        prompt_text,
+        openrouter_api_key,
+        model,
+        timeout_sec,
+        resolved_prompts_dir,
+        max_summary_chars,
+        3200,
+    )
+    current_rows = stage2_rows if stage2_usage.get("openrouter_stage2_status") == "ok" else rows
+    stage3_rows, stage3_usage = _daily_stage3_finalize_rows(
+        current_rows,
+        prompt_text,
+        recent_history,
+        openrouter_api_key,
+        model,
+        timeout_sec,
+        resolved_prompts_dir,
+        max_summary_chars,
+    )
+    if stage3_usage.get("openrouter_stage3_status") == "ok":
+        current_rows = stage3_rows
+
+    usage: dict[str, Any] = {
+        "openrouter_pipeline_mode": "daily_three_stage",
+        "openrouter_pipeline_status": (
+            "ok"
+            if stage2_usage.get("openrouter_stage2_status") == "ok"
+            and stage3_usage.get("openrouter_stage3_status") == "ok"
+            else "partial"
+        ),
+        "openrouter_filter_model": model or DEFAULT_OPENROUTER_MODEL,
+        "openrouter_filter_output_items": len(current_rows),
+        "openrouter_stage2_output_rows": stage2_rows,
+        "openrouter_stage3_output_rows": current_rows,
+    }
+    usage.update(stage2_usage)
+    usage.update(stage3_usage)
+    return current_rows, usage
 
 
 def run_three_stage_openrouter_pipeline(

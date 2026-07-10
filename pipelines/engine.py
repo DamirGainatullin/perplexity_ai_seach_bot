@@ -363,7 +363,14 @@ def format_digest_response(profile: PromptProfile, rows: list[dict[str, str]], u
     lines.append(f"Период: {usage['start_date']} .. {usage['end_date']}")
     lines.append("")
     if not rows:
-        lines.append("Материалы с подтвержденной датой за последние 7 дней не найдены.")
+        lines.append(
+            str(
+                usage.get(
+                    "empty_message",
+                    "Материалы с подтвержденной датой за последние 7 дней не найдены.",
+                )
+            )
+        )
         lines.append("")
     else:
         for idx, row in enumerate(rows, start=1):
@@ -371,7 +378,7 @@ def format_digest_response(profile: PromptProfile, rows: list[dict[str, str]], u
             lines.append(str(row['title']))
             lines.append(f"Резюме: {_truncate_summary_for_output(row['summary'])}")
             lines.append(f"Ссылка: {row['url']}")
-            lines.append(f"Дата: {row['date']}")
+            lines.append(f"Дата: {row['date'] or 'не установлена'}")
             lines.append("")
     return "\n".join(lines).strip()
 
