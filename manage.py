@@ -32,7 +32,11 @@ from pipelines.adaptive_followup import (
 from pipelines.daily_engine import DAILY_PROFILE_CREDIT_RESERVATION, run_daily_pipeline
 from pipelines.engine import format_digest_response, format_digest_response_html, run_budget_pipeline
 from pipelines.models import PromptProfile
-from pipelines.openrouter_filter import DEFAULT_OPENROUTER_MODEL, run_three_stage_openrouter_pipeline
+from pipelines.openrouter_filter import (
+    DEFAULT_OPENROUTER_MODEL,
+    configure_openrouter_proxy,
+    run_three_stage_openrouter_pipeline,
+)
 from pipelines.perplexity_seed import (
     is_perplexity_followup_enabled_for_profile,
     load_aggregated_perplexity_summary_for_profile,
@@ -709,6 +713,7 @@ def load_settings() -> dict[str, Any]:
     followup_max_queries = max(1, _safe_int(env.get("FOLLOWUP_MAX_QUERIES"), DEFAULT_FOLLOWUP_MAX_QUERIES))
     followup_max_results = max(1, _safe_int(env.get("FOLLOWUP_MAX_RESULTS"), DEFAULT_FOLLOWUP_MAX_RESULTS))
     telegram_proxy_url = env.get("TELEGRAM_PROXY_URL", "").strip()
+    openrouter_proxy_url = env.get("OPENROUTER_PROXY_URL", "").strip() or telegram_proxy_url
     schedule_weekday = _safe_int(env.get("SCHEDULE_WEEKDAY"), DEFAULT_SCHEDULE_WEEKDAY)
     if schedule_weekday < 0 or schedule_weekday > 6:
         schedule_weekday = DEFAULT_SCHEDULE_WEEKDAY
@@ -742,6 +747,7 @@ def load_settings() -> dict[str, Any]:
         "followup_max_queries": followup_max_queries,
         "followup_max_results": followup_max_results,
         "telegram_proxy_url": telegram_proxy_url,
+        "openrouter_proxy_url": openrouter_proxy_url,
         "schedule_weekday": schedule_weekday,
         "schedule_hour": schedule_hour,
         "schedule_minute": schedule_minute,
@@ -760,6 +766,7 @@ async def main() -> None:
 
     configure_telegram_proxy(settings["telegram_proxy_url"])
     configure_telegram_feed_proxy(settings["telegram_proxy_url"])
+    configure_openrouter_proxy(settings["openrouter_proxy_url"])
     db_init(DB_PATH)
     startup_now = datetime.now(settings["tz"])
     elapsed_slot = (
@@ -795,6 +802,10 @@ async def main() -> None:
     print(
         "[startup] Telegram proxy: "
         + (mask_proxy_url(settings["telegram_proxy_url"]) if settings["telegram_proxy_url"] else "disabled")
+    )
+    print(
+        "[startup] OpenRouter proxy: "
+        + (mask_proxy_url(settings["openrouter_proxy_url"]) if settings["openrouter_proxy_url"] else "disabled")
     )
     print(
         "[startup] OpenRouter filter: "

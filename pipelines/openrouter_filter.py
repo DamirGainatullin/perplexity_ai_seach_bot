@@ -12,6 +12,7 @@ from core.env import read_text_with_fallback
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_OPENROUTER_MODEL = "openai/gpt-4.1-mini"
+_OPENROUTER_PROXY_URL = ""
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_PROMPTS_DIR = BASE_DIR / "prompts" / "openrouter"
@@ -143,6 +144,20 @@ recently_sent, даже если ссылки различаются. Не уд�
 PROFILE_TOPIC_SPEC:
 {{PROFILE_PROMPT}}
 """.strip()
+
+
+def configure_openrouter_proxy(proxy_url: str) -> None:
+    global _OPENROUTER_PROXY_URL
+    _OPENROUTER_PROXY_URL = (proxy_url or "").strip()
+
+
+def get_openrouter_proxies() -> dict[str, str] | None:
+    if not _OPENROUTER_PROXY_URL:
+        return None
+    return {
+        "http": _OPENROUTER_PROXY_URL,
+        "https": _OPENROUTER_PROXY_URL,
+    }
 
 
 def _compact_prompt(prompt_text: str, max_len: int = 7000) -> str:
@@ -298,13 +313,29 @@ def _call_openrouter_json(
     headers = {
         "Authorization": f"Bearer {openrouter_api_key}",
         "Content-Type": "application/json",
+        "X-OpenRouter-Metadata": "enabled",
     }
 
+    request_kwargs: dict[str, Any] = {
+        "url": OPENROUTER_URL,
+        "json": payload,
+        "headers": headers,
+        "timeout": timeout_sec,
+    }
+    proxies = get_openrouter_proxies()
+    if proxies:
+        request_kwargs["proxies"] = proxies
+
     try:
-        response = requests.post(OPENROUTER_URL, json=payload, headers=headers, timeout=timeout_sec)
+        response = requests.post(**request_kwargs)
         response.raise_for_status()
         data = response.json()
     except Exception as exc:
+        response_obj = getattr(exc, "response", None)
+        if response_obj is not None:
+            status_code = getattr(response_obj, "status_code", "unknown")
+            response_body = " ".join(str(getattr(response_obj, "text", "") or "").split())[:1500]
+            return None, {}, f"error_request: status={status_code} body={response_body}"
         return None, {}, f"error_request: {exc}"
 
     usage = data.get("usage") if isinstance(data, dict) else {}

@@ -52,6 +52,11 @@ def mask_proxy_url(proxy_url: str) -> str:
     return urlunsplit((parts.scheme, f"***@{host_part}", parts.path, parts.query, parts.fragment))
 
 
+def _redact_bot_token(value: object, bot_token: str) -> str:
+    text = str(value)
+    return text.replace(bot_token, "***") if bot_token else text
+
+
 def tg_request(bot_token: str, method: str, payload: Optional[dict] = None) -> dict:
     url = TELEGRAM_API_URL.format(token=bot_token, method=method)
     http_method = "GET"
@@ -83,9 +88,9 @@ def tg_request(bot_token: str, method: str, payload: Optional[dict] = None) -> d
             raise RuntimeError(
                 "Telegram SOCKS proxy requires PySocks support. Install dependencies from requirements.txt."
             ) from exc
-        raise RuntimeError(f"Telegram network error: {exc}") from exc
+        raise RuntimeError(f"Telegram network error: {_redact_bot_token(exc, bot_token)}") from exc
     except RequestException as exc:
-        raise RuntimeError(f"Telegram network error: {exc}") from exc
+        raise RuntimeError(f"Telegram network error: {_redact_bot_token(exc, bot_token)}") from exc
     if not body.get("ok"):
         raise RuntimeError(f"Telegram API returned error: {body}")
     return body["result"]

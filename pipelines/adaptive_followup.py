@@ -19,7 +19,7 @@ from pipelines.helpers import (
     short_query,
 )
 from pipelines.models import PromptProfile
-from pipelines.openrouter_filter import DEFAULT_OPENROUTER_MODEL, OPENROUTER_URL
+from pipelines.openrouter_filter import DEFAULT_OPENROUTER_MODEL, OPENROUTER_URL, get_openrouter_proxies
 
 
 DEFAULT_FOLLOWUP_CREDIT_CAP = 8.0
@@ -131,13 +131,29 @@ def _call_planner_model(
     headers = {
         "Authorization": f"Bearer {openrouter_api_key}",
         "Content-Type": "application/json",
+        "X-OpenRouter-Metadata": "enabled",
     }
 
+    request_kwargs: dict[str, Any] = {
+        "url": OPENROUTER_URL,
+        "json": payload,
+        "headers": headers,
+        "timeout": timeout_sec,
+    }
+    proxies = get_openrouter_proxies()
+    if proxies:
+        request_kwargs["proxies"] = proxies
+
     try:
-        response = requests.post(OPENROUTER_URL, json=payload, headers=headers, timeout=timeout_sec)
+        response = requests.post(**request_kwargs)
         response.raise_for_status()
         data = response.json()
     except Exception as exc:
+        response_obj = getattr(exc, "response", None)
+        if response_obj is not None:
+            status_code = getattr(response_obj, "status_code", "unknown")
+            response_body = " ".join(str(getattr(response_obj, "text", "") or "").split())[:1500]
+            return None, {}, f"error_request: status={status_code} body={response_body}"
         return None, {}, f"error_request: {exc}"
 
     content = (

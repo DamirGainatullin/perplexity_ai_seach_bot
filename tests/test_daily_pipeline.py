@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from datetime import date, datetime, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from core.db import (
     db_get_cached_result,
@@ -18,8 +18,14 @@ from core.db import (
     db_toggle_schedule_subscription,
 )
 from manage import _is_schedule_due
+from core.telegram_api import _redact_bot_token
+from pipelines.adaptive_followup import _call_planner_model
 from pipelines.daily_engine import _labeled_publication_date, build_daily_probe_query, run_daily_pipeline
-from pipelines.openrouter_filter import run_daily_stage1_openrouter
+from pipelines.openrouter_filter import (
+    _call_openrouter_json,
+    configure_openrouter_proxy,
+    run_daily_stage1_openrouter,
+)
 from pipelines.profiles.logistics import build_logistics_profile
 
 
@@ -283,6 +289,67 @@ class DailyDatabaseTests(unittest.TestCase):
             self.assertEqual(previous, "daily")
             self.assertEqual(skipped, 0)
             self.assertEqual(db_list_due_schedule_chat_ids(db_path, "2026-07-11"), [123])
+
+
+class ProxyTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        configure_openrouter_proxy("")
+
+    @staticmethod
+    def _response(content: str) -> Mock:
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "choices": [{"message": {"content": content}}],
+            "usage": {},
+        }
+        return response
+
+    @patch("pipelines.openrouter_filter.requests.post")
+    def test_daily_openrouter_call_uses_configured_proxy(self, post_mock) -> None:
+        post_mock.return_value = self._response('{"keep_indices":[]}')
+        configure_openrouter_proxy("socks5h://user:pass@proxy.test:1080")
+
+        _parsed, _usage, status = _call_openrouter_json(
+            system_prompt="prompt",
+            user_payload={"materials": []},
+            openrouter_api_key="key",
+            model="openai/gpt-4.1-mini",
+            max_tokens=20,
+            timeout_sec=10,
+        )
+
+        self.assertEqual(status, "ok")
+        self.assertEqual(
+            post_mock.call_args.kwargs["proxies"],
+            {
+                "http": "socks5h://user:pass@proxy.test:1080",
+                "https": "socks5h://user:pass@proxy.test:1080",
+            },
+        )
+
+    @patch("pipelines.adaptive_followup.requests.post")
+    def test_weekly_planner_uses_same_proxy(self, post_mock) -> None:
+        post_mock.return_value = self._response('{"queries":[]}')
+        configure_openrouter_proxy("socks5://proxy.test:1080")
+
+        _parsed, _usage, status = _call_planner_model(
+            openrouter_api_key="key",
+            model="openai/gpt-4.1-mini",
+            system_prompt="prompt",
+            user_payload={},
+            timeout_sec=10,
+            max_tokens=20,
+        )
+
+        self.assertEqual(status, "ok")
+        self.assertEqual(post_mock.call_args.kwargs["proxies"]["https"], "socks5://proxy.test:1080")
+
+    def test_telegram_token_is_removed_from_network_errors(self) -> None:
+        token = "123456:secret-token"
+        redacted = _redact_bot_token(f"https://api.telegram.org/bot{token}/getUpdates", token)
+        self.assertNotIn(token, redacted)
+        self.assertIn("bot***/getUpdates", redacted)
 
 
 if __name__ == "__main__":
