@@ -1,8 +1,9 @@
+import asyncio
 import tempfile
 import unittest
 from datetime import date, datetime, timezone
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from core.db import (
     db_get_cached_result,
@@ -17,7 +18,13 @@ from core.db import (
     db_save_digest_history,
     db_toggle_schedule_subscription,
 )
-from manage import _is_schedule_due
+from manage import (
+    DEFAULT_SCHEDULE_PROFILE_ROTATION,
+    _build_scheduled_reports,
+    _is_schedule_due,
+    _parse_schedule_profile_rotation,
+    _scheduled_command_for_day,
+)
 from core.telegram_api import _redact_bot_token
 from pipelines.adaptive_followup import _call_planner_model
 from pipelines.daily_engine import _labeled_publication_date, build_daily_probe_query, run_daily_pipeline
@@ -261,10 +268,33 @@ class DailyDatabaseTests(unittest.TestCase):
             self.assertTrue(enabled)
             self.assertEqual(db_list_due_schedule_chat_ids(db_path, "2026-07-10"), [])
 
-    def test_daily_schedule_ignores_weekday_but_weekly_does_not(self) -> None:
+    def test_rotating_schedule_runs_every_day_after_configured_time(self) -> None:
         friday = datetime(2026, 7, 10, 8, 30, tzinfo=timezone.utc)
-        self.assertTrue(_is_schedule_due(friday, "daily", 0, 8, 30))
-        self.assertFalse(_is_schedule_due(friday, "weekly", 0, 8, 30))
+        self.assertTrue(_is_schedule_due(friday, 8, 30))
+        self.assertFalse(_is_schedule_due(friday.replace(hour=8, minute=29), 8, 30))
+
+    def test_weekday_rotation_starts_with_logistics_then_rop(self) -> None:
+        monday = datetime(2026, 7, 13, 8, 30, tzinfo=timezone.utc)
+        expected = (
+            "/logistics",
+            "/rop",
+            "/metanol",
+            "/precursors",
+            "/chesny_znak",
+            "/spot",
+            "/sales",
+        )
+        self.assertEqual(DEFAULT_SCHEDULE_PROFILE_ROTATION, expected)
+        self.assertEqual(
+            tuple(_scheduled_command_for_day(monday.replace(day=13 + offset), expected) for offset in range(7)),
+            expected,
+        )
+
+    def test_schedule_rotation_can_be_configured_without_slashes(self) -> None:
+        parsed = _parse_schedule_profile_rotation(
+            "logistics,rop,metanol,precursors,chesny_znak,spot,sales"
+        )
+        self.assertEqual(parsed, DEFAULT_SCHEDULE_PROFILE_ROTATION)
 
     def test_first_mode_transition_skips_elapsed_slot_only_once(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
@@ -289,6 +319,36 @@ class DailyDatabaseTests(unittest.TestCase):
             self.assertEqual(previous, "daily")
             self.assertEqual(skipped, 0)
             self.assertEqual(db_list_due_schedule_chat_ids(db_path, "2026-07-11"), [123])
+
+
+class ScheduleRotationTests(unittest.IsolatedAsyncioTestCase):
+    @patch("manage.generate_by_profile_with_usage", new_callable=AsyncMock)
+    async def test_scheduled_builder_generates_only_selected_profile(self, generate_mock) -> None:
+        logistics = object()
+        rop = object()
+        generate_mock.return_value = ("ROP report", {"final_rows_count": 2})
+
+        reports = await _build_scheduled_reports(
+            {"/logistics": logistics, "/rop": rop},
+            "/rop",
+            "tavily-key",
+            "openrouter-key",
+            "openai/gpt-4.1-mini",
+            True,
+            8.0,
+            4,
+            6,
+            timezone.utc,
+            "weekly",
+            2,
+            28.0,
+            asyncio.Lock(),
+        )
+
+        self.assertEqual(reports, [("/rop", "ROP report", True, 2)])
+        generate_mock.assert_awaited_once()
+        self.assertIs(generate_mock.await_args.args[7], rop)
+        self.assertEqual(generate_mock.await_args.kwargs["digest_mode"], "weekly")
 
 
 class ProxyTests(unittest.TestCase):

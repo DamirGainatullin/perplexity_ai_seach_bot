@@ -51,13 +51,21 @@ PROMPTS_DIR = BASE_DIR / "prompts"
 DB_PATH = BASE_DIR / "weekly_bot.sqlite3"
 DEFAULT_TZ = "Europe/Moscow"
 SCHEDULE_COMMAND = "/schedule"
-DEFAULT_DIGEST_MODE = "daily"
+DEFAULT_DIGEST_MODE = "weekly"
 DEFAULT_DAILY_LOOKBACK_DAYS = 2
 DEFAULT_DAILY_TAVILY_CREDIT_LIMIT = 28.0
-DEFAULT_SCHEDULE_WEEKDAY = 0
 DEFAULT_SCHEDULE_HOUR = 8
 DEFAULT_SCHEDULE_MINUTE = 30
 DEFAULT_SCHEDULE_POLL_INTERVAL_SEC = 30
+DEFAULT_SCHEDULE_PROFILE_ROTATION = (
+    "/logistics",
+    "/rop",
+    "/metanol",
+    "/precursors",
+    "/chesny_znak",
+    "/spot",
+    "/sales",
+)
 CLEAR_TARGET_ALIASES = {
     "logistic": "logistics",
     "logistics": "logistics",
@@ -120,6 +128,19 @@ def _safe_schedule_time(raw: str | None, default_hour: int, default_minute: int)
     return hour, minute
 
 
+def _parse_schedule_profile_rotation(raw: str | None) -> tuple[str, ...]:
+    if not raw or not raw.strip():
+        return DEFAULT_SCHEDULE_PROFILE_ROTATION
+    commands = tuple(
+        value if value.startswith("/") else f"/{value}"
+        for value in (part.strip().lower() for part in raw.split(","))
+        if value
+    )
+    if len(commands) != 7 or len(set(commands)) != 7:
+        raise RuntimeError("SCHEDULE_PROFILE_ROTATION must contain exactly 7 unique comma-separated commands")
+    return commands
+
+
 def get_prompt_commands(profiles: dict[str, PromptProfile]) -> dict[str, Path]:
     return {command: profile.prompt_path for command, profile in profiles.items()}
 
@@ -139,14 +160,14 @@ def _resolve_clear_profile(profiles: dict[str, PromptProfile], command: str) -> 
 
 def _is_schedule_due(
     now: datetime,
-    digest_mode: str,
-    schedule_weekday: int,
     schedule_hour: int,
     schedule_minute: int,
 ) -> bool:
-    if digest_mode == "weekly" and now.weekday() != schedule_weekday:
-        return False
     return (now.hour, now.minute) >= (schedule_hour, schedule_minute)
+
+
+def _scheduled_command_for_day(now: datetime, rotation: tuple[str, ...]) -> str:
+    return rotation[now.weekday()]
 
 
 async def generate_by_profile(
@@ -348,7 +369,7 @@ async def handle_start(bot_token: str, chat_id: int, commands: dict[str, Path], 
     visible_commands = sorted(commands.keys())
     visible_commands.append(SCHEDULE_COMMAND)
     cmd_text = ", ".join(visible_commands) if visible_commands else "(нет доступных команд)"
-    period = "ежедневную" if digest_mode == "daily" else "еженедельную"
+    period = "ежедневную" if digest_mode == "daily" else "ежедневную ротацию недельных сводок"
     text = f"Бот готов. Авторассылку можно включить командой /schedule ({period}).\nДоступные команды:\n{cmd_text}"
     await tg_send_text(bot_token, chat_id, text)
 
@@ -424,7 +445,6 @@ async def handle_schedule_command(
     chat_id: int,
     digest_mode: str,
     tz,
-    schedule_weekday: int,
     schedule_hour: int,
     schedule_minute: int,
 ) -> None:
@@ -432,7 +452,7 @@ async def handle_schedule_command(
     now = datetime.now(tz)
     elapsed_slot = (
         now.date().isoformat()
-        if _is_schedule_due(now, digest_mode, schedule_weekday, schedule_hour, schedule_minute)
+        if _is_schedule_due(now, schedule_hour, schedule_minute)
         else None
     )
     enabled = await asyncio.to_thread(
@@ -442,11 +462,15 @@ async def handle_schedule_command(
         initial_last_sent_at=elapsed_slot,
     )
     if enabled:
-        period = "Ежедневные" if digest_mode == "daily" else "Еженедельные"
+        period = (
+            "Ежедневные сводки"
+            if digest_mode == "daily"
+            else "Одна недельная сводка по направлению"
+        )
         await tg_send_text(
             bot_token,
             chat_id,
-            f"Авторассылка включена. {period} сводки по всем направлениям будут приходить сюда по расписанию сервера.",
+            f"Авторассылка включена. {period} будет приходить сюда ежедневно по расписанию сервера.",
         )
     else:
         await tg_send_text(
@@ -458,6 +482,7 @@ async def handle_schedule_command(
 
 async def _build_scheduled_reports(
     profiles: dict[str, PromptProfile],
+    scheduled_command: str,
     tavily_api_key: str,
     openrouter_api_key: str,
     openrouter_model: str,
@@ -471,34 +496,33 @@ async def _build_scheduled_reports(
     daily_tavily_credit_limit: float,
     request_lock: asyncio.Lock,
 ) -> list[tuple[str, str, bool, int]]:
-    reports: list[tuple[str, str, bool, int]] = []
-    for command, profile in sorted(profiles.items()):
-        try:
-            async with request_lock:
-                result, usage = await generate_by_profile_with_usage(
-                    tavily_api_key,
-                    openrouter_api_key,
-                    openrouter_model,
-                    adaptive_followup_enabled,
-                    followup_credit_cap,
-                    followup_max_queries,
-                    followup_max_results,
-                    profile,
-                    tz,
-                    digest_mode=digest_mode,
-                    daily_lookback_days=daily_lookback_days,
-                    daily_tavily_credit_limit=daily_tavily_credit_limit,
-                )
-            reports.append((command, result, True, int(usage.get("final_rows_count", -1))))
-        except Exception as exc:
-            reports.append((command, f"Ошибка при плановой сводке {command}: {exc}", False, -1))
-    return reports
+    profile = profiles[scheduled_command]
+    try:
+        async with request_lock:
+            result, usage = await generate_by_profile_with_usage(
+                tavily_api_key,
+                openrouter_api_key,
+                openrouter_model,
+                adaptive_followup_enabled,
+                followup_credit_cap,
+                followup_max_queries,
+                followup_max_results,
+                profile,
+                tz,
+                digest_mode=digest_mode,
+                daily_lookback_days=daily_lookback_days,
+                daily_tavily_credit_limit=daily_tavily_credit_limit,
+            )
+        return [(scheduled_command, result, True, int(usage.get("final_rows_count", -1)))]
+    except Exception as exc:
+        return [(scheduled_command, f"Ошибка при плановой сводке {scheduled_command}: {exc}", False, -1)]
 
 
 async def run_scheduled_broadcast(
     bot_token: str,
     chat_ids: list[int],
     profiles: dict[str, PromptProfile],
+    scheduled_command: str,
     tavily_api_key: str,
     openrouter_api_key: str,
     openrouter_model: str,
@@ -518,6 +542,7 @@ async def run_scheduled_broadcast(
 
     reports = await _build_scheduled_reports(
         profiles,
+        scheduled_command,
         tavily_api_key,
         openrouter_api_key,
         openrouter_model,
@@ -536,7 +561,11 @@ async def run_scheduled_broadcast(
     for chat_id in chat_ids:
         try:
             if nonempty_reports:
-                await tg_send_text(bot_token, chat_id, f"Плановая рассылка за {schedule_slot}.")
+                await tg_send_text(
+                    bot_token,
+                    chat_id,
+                    f"Плановая рассылка за {schedule_slot}: {scheduled_command}.",
+                )
                 for _command, text, is_digest, _item_count in nonempty_reports:
                     if is_digest:
                         await tg_send_text(bot_token, chat_id, format_digest_response_html(text), parse_mode="HTML")
@@ -544,9 +573,9 @@ async def run_scheduled_broadcast(
                         await tg_send_text(bot_token, chat_id, text)
             else:
                 empty_text = (
-                    "За прошедшие сутки новых релевантных материалов по всем направлениям не найдено."
+                    f"За прошедшие сутки новых релевантных материалов по направлению {scheduled_command} не найдено."
                     if digest_mode == "daily"
-                    else "За последние семь дней новых релевантных материалов по всем направлениям не найдено."
+                    else f"За последние семь дней новых релевантных материалов по направлению {scheduled_command} не найдено."
                 )
                 await tg_send_text(
                     bot_token,
@@ -572,7 +601,7 @@ async def schedule_loop(
     digest_mode: str,
     daily_lookback_days: int,
     daily_tavily_credit_limit: float,
-    schedule_weekday: int,
+    schedule_profile_rotation: tuple[str, ...],
     schedule_hour: int,
     schedule_minute: int,
     schedule_poll_interval_sec: int,
@@ -581,15 +610,20 @@ async def schedule_loop(
     while True:
         try:
             now = datetime.now(tz)
-            if _is_schedule_due(now, digest_mode, schedule_weekday, schedule_hour, schedule_minute):
+            if _is_schedule_due(now, schedule_hour, schedule_minute):
                 schedule_slot = now.date().isoformat()
+                scheduled_command = _scheduled_command_for_day(now, schedule_profile_rotation)
                 chat_ids = await asyncio.to_thread(db_list_due_schedule_chat_ids, DB_PATH, schedule_slot)
                 if chat_ids:
-                    print(f"[schedule] sending {digest_mode} digest to {len(chat_ids)} chat(s) for {schedule_slot}")
+                    print(
+                        f"[schedule] sending {digest_mode} digest {scheduled_command} "
+                        f"to {len(chat_ids)} chat(s) for {schedule_slot}"
+                    )
                     await run_scheduled_broadcast(
                         bot_token,
                         chat_ids,
                         profiles,
+                        scheduled_command,
                         tavily_api_key,
                         openrouter_api_key,
                         openrouter_model,
@@ -624,7 +658,6 @@ async def poll_loop(
     digest_mode: str,
     daily_lookback_days: int,
     daily_tavily_credit_limit: float,
-    schedule_weekday: int,
     schedule_hour: int,
     schedule_minute: int,
     request_lock: asyncio.Lock,
@@ -653,7 +686,6 @@ async def poll_loop(
                         chat_id,
                         digest_mode,
                         tz,
-                        schedule_weekday,
                         schedule_hour,
                         schedule_minute,
                     )
@@ -714,9 +746,7 @@ def load_settings() -> dict[str, Any]:
     followup_max_results = max(1, _safe_int(env.get("FOLLOWUP_MAX_RESULTS"), DEFAULT_FOLLOWUP_MAX_RESULTS))
     telegram_proxy_url = env.get("TELEGRAM_PROXY_URL", "").strip()
     openrouter_proxy_url = env.get("OPENROUTER_PROXY_URL", "").strip() or telegram_proxy_url
-    schedule_weekday = _safe_int(env.get("SCHEDULE_WEEKDAY"), DEFAULT_SCHEDULE_WEEKDAY)
-    if schedule_weekday < 0 or schedule_weekday > 6:
-        schedule_weekday = DEFAULT_SCHEDULE_WEEKDAY
+    schedule_profile_rotation = _parse_schedule_profile_rotation(env.get("SCHEDULE_PROFILE_ROTATION"))
     schedule_hour, schedule_minute = _safe_schedule_time(
         env.get("SCHEDULE_TIME"),
         DEFAULT_SCHEDULE_HOUR,
@@ -748,7 +778,7 @@ def load_settings() -> dict[str, Any]:
         "followup_max_results": followup_max_results,
         "telegram_proxy_url": telegram_proxy_url,
         "openrouter_proxy_url": openrouter_proxy_url,
-        "schedule_weekday": schedule_weekday,
+        "schedule_profile_rotation": schedule_profile_rotation,
         "schedule_hour": schedule_hour,
         "schedule_minute": schedule_minute,
         "schedule_poll_interval_sec": schedule_poll_interval_sec,
@@ -763,6 +793,13 @@ async def main() -> None:
     profiles = load_profiles(PROMPTS_DIR)
     if not profiles:
         raise RuntimeError("No supported prompt files found in prompts directory.")
+    missing_scheduled_commands = [
+        command for command in settings["schedule_profile_rotation"] if command not in profiles
+    ]
+    if missing_scheduled_commands:
+        raise RuntimeError(
+            "Schedule rotation references unavailable profiles: " + ", ".join(missing_scheduled_commands)
+        )
 
     configure_telegram_proxy(settings["telegram_proxy_url"])
     configure_telegram_feed_proxy(settings["telegram_proxy_url"])
@@ -773,8 +810,6 @@ async def main() -> None:
         startup_now.date().isoformat()
         if _is_schedule_due(
             startup_now,
-            settings["digest_mode"],
-            settings["schedule_weekday"],
             settings["schedule_hour"],
             settings["schedule_minute"],
         )
@@ -820,9 +855,10 @@ async def main() -> None:
     )
     print(
         "[startup] Schedule: "
-        f"mode={settings['digest_mode']}, enabled via {SCHEDULE_COMMAND}, weekday={settings['schedule_weekday']}, "
+        f"mode={settings['digest_mode']}, enabled via {SCHEDULE_COMMAND}, "
         f"time={settings['schedule_hour']:02d}:{settings['schedule_minute']:02d}, "
-        f"poll_interval={settings['schedule_poll_interval_sec']}s"
+        f"poll_interval={settings['schedule_poll_interval_sec']}s, "
+        f"rotation={','.join(settings['schedule_profile_rotation'])}"
     )
 
     schedule_task = asyncio.create_task(
@@ -840,7 +876,7 @@ async def main() -> None:
             settings["digest_mode"],
             settings["daily_lookback_days"],
             settings["daily_tavily_credit_limit"],
-            settings["schedule_weekday"],
+            settings["schedule_profile_rotation"],
             settings["schedule_hour"],
             settings["schedule_minute"],
             settings["schedule_poll_interval_sec"],
@@ -862,7 +898,6 @@ async def main() -> None:
             settings["digest_mode"],
             settings["daily_lookback_days"],
             settings["daily_tavily_credit_limit"],
-            settings["schedule_weekday"],
             settings["schedule_hour"],
             settings["schedule_minute"],
             request_lock,
