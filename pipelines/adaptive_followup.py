@@ -13,13 +13,12 @@ from tavily import TavilyClient
 from pipelines.helpers import (
     build_summary,
     infer_category,
-    parse_date_candidates,
     parse_date_from_url,
-    parse_published_iso,
     short_query,
 )
 from pipelines.models import PromptProfile
 from pipelines.openrouter_filter import DEFAULT_OPENROUTER_MODEL, OPENROUTER_URL, get_openrouter_proxies
+from pipelines.publication_date import verify_publication_dates
 
 
 DEFAULT_FOLLOWUP_CREDIT_CAP = 8.0
@@ -390,8 +389,7 @@ def run_followup_queries(
     extract_credits = 0.0
     runs_executed = 0
     errors: list[str] = []
-    merged_by_url: dict[str, dict[str, Any]] = {}
-    pending_no_date: dict[str, dict[str, Any]] = {}
+    merged_candidates: dict[str, dict[str, Any]] = {}
     runs_debug: list[dict[str, Any]] = []
 
     for query in queries:
@@ -463,54 +461,37 @@ def run_followup_queries(
 
             score = float(item.get("score", 0.0) or 0.0)
 
-            published_iso = parse_published_iso(str(item.get("published_date", "")))
-            url_date = parse_date_from_url(url)
-            url_date_iso = url_date.isoformat() if url_date else ""
-
-            effective_date = ""
-            if published_iso:
-                try:
-                    pub_d = date.fromisoformat(published_iso)
-                    if start_d <= pub_d <= end_d:
-                        effective_date = published_iso
-                except ValueError:
-                    pass
-            if (not effective_date) and url_date_iso:
-                try:
-                    url_d = date.fromisoformat(url_date_iso)
-                    if start_d <= url_d <= end_d:
-                        effective_date = url_date_iso
-                except ValueError:
-                    pass
-
             base_candidate = {
                 "title": str(item.get("title", "(Р±РµР· Р·Р°РіРѕР»РѕРІРєР°)")).strip() or "(Р±РµР· Р·Р°РіРѕР»РѕРІРєР°)",
                 "content": str(item.get("content", "")),
                 "url": str(url).strip(),
                 "quality_score": score,
+                "tavily_published_date": str(item.get("published_date", "")),
             }
-            if effective_date:
-                candidate = dict(base_candidate)
-                candidate["date"] = effective_date
-                old = merged_by_url.get(candidate["url"])
-                if old is None or float(candidate["quality_score"]) > float(old.get("quality_score", 0.0)):
-                    merged_by_url[candidate["url"]] = candidate
-            else:
-                old_pending = pending_no_date.get(base_candidate["url"])
-                if old_pending is None or float(base_candidate["quality_score"]) > float(old_pending.get("quality_score", 0.0)):
-                    pending_no_date[base_candidate["url"]] = base_candidate
+            old_candidate = merged_candidates.get(base_candidate["url"])
+            if old_candidate is None or float(base_candidate["quality_score"]) > float(
+                old_candidate.get("quality_score", 0.0)
+            ):
+                merged_candidates[base_candidate["url"]] = base_candidate
 
     extract_urls_requested: list[str] = []
     extract_urls_extracted = 0
-    if pending_no_date:
-        pending_ranked = sorted(
-            pending_no_date.values(),
-            key=lambda x: float(x.get("quality_score", 0.0)),
-            reverse=True,
-        )
+    extracted_by_url: dict[str, str] = {}
+    verification_pool = sorted(
+        merged_candidates.values(),
+        key=lambda x: float(x.get("quality_score", 0.0)),
+        reverse=True,
+    )[:FOLLOWUP_EXTRACT_URL_LIMIT]
+    pending_without_tavily_date = [
+        item
+        for item in verification_pool
+        if not str(item.get("tavily_published_date", "")).strip()
+        and parse_date_from_url(str(item.get("url", ""))) is None
+    ]
+    if pending_without_tavily_date:
         extract_urls_requested = [
             str(item.get("url", "")).strip()
-            for item in pending_ranked[:FOLLOWUP_EXTRACT_URL_LIMIT]
+            for item in pending_without_tavily_date
             if str(item.get("url", "")).strip()
         ]
         if extract_urls_requested:
@@ -528,27 +509,49 @@ def run_followup_queries(
                 extract_urls_extracted = len(extract_response.get("results", []) or [])
                 for entry in extract_response.get("results", []) or []:
                     url = str(entry.get("url", "")).strip()
-                    if not url or url not in pending_no_date:
+                    if not url:
                         continue
                     raw = str(entry.get("raw_content", "") or entry.get("content", ""))
-                    head = " ".join(raw.split())[:1800]
-                    effective_date = ""
-                    for cand in parse_date_candidates(head):
-                        if start_d <= cand <= end_d:
-                            effective_date = cand.isoformat()
-                            break
-                    if not effective_date:
-                        continue
-                    candidate = dict(pending_no_date[url])
-                    candidate["date"] = effective_date
-                    old = merged_by_url.get(url)
-                    if old is None or float(candidate["quality_score"]) > float(old.get("quality_score", 0.0)):
-                        merged_by_url[url] = candidate
+                    extracted_by_url[url] = raw
             except Exception as exc:
                 errors.append(f"extract: {exc}")
 
+    verification_inputs = [
+        {
+            "url": str(item.get("url", "")),
+            "tavily_published_date": str(item.get("tavily_published_date", "")),
+            "extracted_text": extracted_by_url.get(str(item.get("url", "")), ""),
+        }
+        for item in verification_pool
+    ]
+    verified_dates = verify_publication_dates(verification_inputs, start_d, end_d)
+    verified_candidates: list[dict[str, Any]] = []
+    date_rejections: list[dict[str, str]] = []
+    for item in verification_pool:
+        url = str(item.get("url", ""))
+        verification = verified_dates.get(url)
+        if verification is None or verification.status != "verified":
+            date_rejections.append(
+                {
+                    "url": url,
+                    "reason": verification.status if verification else "verification_missing",
+                    "date": verification.date_iso if verification else "",
+                    "source": verification.source if verification else "",
+                    "tavily_published_date": (
+                        verification.tavily_published_date
+                        if verification
+                        else str(item.get("tavily_published_date", ""))
+                    ),
+                }
+            )
+            continue
+        candidate = dict(item)
+        candidate["date"] = verification.date_iso
+        candidate["date_confidence"] = verification.source
+        verified_candidates.append(candidate)
+
     ranked = sorted(
-        merged_by_url.values(),
+        verified_candidates,
         key=lambda x: (x.get("date", ""), float(x.get("quality_score", 0.0))),
         reverse=True,
     )
@@ -574,6 +577,9 @@ def run_followup_queries(
         "followup_extract_credits": extract_credits,
         "followup_extract_urls_requested": len(extract_urls_requested),
         "followup_extract_urls_extracted": extract_urls_extracted,
+        "followup_date_verification_candidates": len(verification_pool),
+        "followup_date_verified": len(verified_candidates),
+        "followup_date_rejections": date_rejections[:20],
         "followup_search_credit_cap": float(credit_cap),
         "followup_search_errors_count": len(errors),
         "followup_search_errors": errors[:20],

@@ -237,6 +237,15 @@ def parse_date_candidates(text: str) -> list[date]:
             _push(date(int(y), int(month), int(d)))
         except ValueError:
             pass
+    for month_word, d, y in re.findall(r"\b([А-Яа-яЁё]{3,15})\s+(\d{1,2}),?\s+(20\d{2})\b", text):
+        month_key = month_word.strip().lower()
+        month = RUS_MONTHS.get(month_key)
+        if not month:
+            continue
+        try:
+            _push(date(int(y), int(month), int(d)))
+        except ValueError:
+            pass
     return candidates
 
 
