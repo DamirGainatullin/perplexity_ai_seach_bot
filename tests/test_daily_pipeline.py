@@ -41,9 +41,10 @@ class FakeTavilyClient:
     search_payloads: list[dict] = []
     extract_responses: list[dict] = []
     extract_payloads: list[dict] = []
+    proxies: dict[str, str] | None = None
 
-    def __init__(self, _api_key: str) -> None:
-        pass
+    def __init__(self, _api_key: str, proxies: dict[str, str] | None = None) -> None:
+        type(self).proxies = proxies
 
     def search(self, **payload):
         self.search_payloads.append(payload)
@@ -64,6 +65,7 @@ class DailyPipelineTests(unittest.TestCase):
         FakeTavilyClient.search_responses = []
         FakeTavilyClient.extract_payloads = []
         FakeTavilyClient.extract_responses = []
+        FakeTavilyClient.proxies = None
 
     def test_probe_query_is_daily_and_profile_specific(self) -> None:
         query = build_daily_probe_query(_profile(), date(2026, 7, 10))

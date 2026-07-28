@@ -19,6 +19,7 @@ from pipelines.helpers import (
 from pipelines.models import PromptProfile
 from pipelines.openrouter_filter import DEFAULT_OPENROUTER_MODEL, OPENROUTER_URL, get_openrouter_proxies
 from pipelines.publication_date import verify_publication_dates
+from pipelines.tavily_proxy import format_tavily_error, get_tavily_proxies
 
 
 DEFAULT_FOLLOWUP_CREDIT_CAP = 8.0
@@ -354,7 +355,7 @@ def _search_with_retry(client: TavilyClient, payload: dict[str, Any]) -> dict[st
         except (RequestException, Exception) as exc:
             last_error = exc
             time.sleep(1.2 * attempt)
-    raise RuntimeError(f"Tavily search failed after retries: {last_error}") from last_error
+    raise RuntimeError(f"Tavily search failed after retries: {format_tavily_error(last_error)}") from last_error
 
 
 def _extract_with_retry(client: TavilyClient, payload: dict[str, Any]) -> dict[str, Any]:
@@ -365,7 +366,7 @@ def _extract_with_retry(client: TavilyClient, payload: dict[str, Any]) -> dict[s
         except (RequestException, Exception) as exc:
             last_error = exc
             time.sleep(1.2 * attempt)
-    raise RuntimeError(f"Tavily extract failed after retries: {last_error}") from last_error
+    raise RuntimeError(f"Tavily extract failed after retries: {format_tavily_error(last_error)}") from last_error
 
 
 def run_followup_queries(
@@ -384,7 +385,7 @@ def run_followup_queries(
     start_d = date.fromisoformat(start_date)
     end_d = date.fromisoformat(end_date)
 
-    client = TavilyClient(tavily_api_key)
+    client = TavilyClient(tavily_api_key, proxies=get_tavily_proxies())
     search_credits = 0.0
     extract_credits = 0.0
     runs_executed = 0

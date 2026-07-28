@@ -19,6 +19,7 @@ from pipelines.helpers import (
 )
 from pipelines.models import PromptProfile, QueryRule
 from pipelines.publication_date import verify_publication_dates
+from pipelines.tavily_proxy import format_tavily_error, get_tavily_proxies
 from pipelines.telegram_feed import extract_telegram_channels, parse_recent_open_channel_posts
 
 _SECTION_LINE_RE = re.compile(r"^\d+\)\s+")
@@ -56,7 +57,7 @@ def _search_with_retry(client: TavilyClient, payload: dict[str, Any]) -> dict[st
         except (RequestException, Exception) as exc:
             last_error = exc
             time.sleep(1.2 * attempt)
-    raise RuntimeError(f"Tavily search failed after retries: {last_error}") from last_error
+    raise RuntimeError(f"Tavily search failed after retries: {format_tavily_error(last_error)}") from last_error
 
 
 def _extract_with_retry(client: TavilyClient, payload: dict[str, Any]) -> dict[str, Any]:
@@ -67,7 +68,7 @@ def _extract_with_retry(client: TavilyClient, payload: dict[str, Any]) -> dict[s
         except (RequestException, Exception) as exc:
             last_error = exc
             time.sleep(1.2 * attempt)
-    raise RuntimeError(f"Tavily extract failed after retries: {last_error}") from last_error
+    raise RuntimeError(f"Tavily extract failed after retries: {format_tavily_error(last_error)}") from last_error
 
 
 def run_budget_pipeline(
@@ -84,7 +85,7 @@ def run_budget_pipeline(
     start_date = (now_date - timedelta(days=7)).isoformat()
     end_date = now_date.isoformat()
 
-    client = TavilyClient(tavily_api_key)
+    client = TavilyClient(tavily_api_key, proxies=get_tavily_proxies())
     plan = profile.query_plan[: profile.budget.search_run_limit]
     runs: list[SearchRun] = []
     search_credits = 0.0

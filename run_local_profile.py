@@ -9,6 +9,7 @@ from pathlib import Path
 from core.db import db_init
 from manage import DB_PATH, PROMPTS_DIR, generate_by_profile_with_usage, load_settings
 from pipelines.profiles import load_profiles
+from pipelines.tavily_proxy import configure_tavily_proxy
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -52,6 +53,7 @@ async def main() -> None:
     args = parser.parse_args()
 
     settings = load_settings()
+    configure_tavily_proxy(settings["tavily_proxy_url"])
     profiles = load_profiles(PROMPTS_DIR)
     db_init(DB_PATH)
     profile = profiles.get(args.command)

@@ -42,6 +42,7 @@ from pipelines.perplexity_seed import (
     load_aggregated_perplexity_summary_for_profile,
 )
 from pipelines.profiles import load_profiles
+from pipelines.tavily_proxy import configure_tavily_proxy
 from pipelines.telegram_feed import configure_telegram_feed_proxy
 
 
@@ -746,6 +747,7 @@ def load_settings() -> dict[str, Any]:
     followup_max_results = max(1, _safe_int(env.get("FOLLOWUP_MAX_RESULTS"), DEFAULT_FOLLOWUP_MAX_RESULTS))
     telegram_proxy_url = env.get("TELEGRAM_PROXY_URL", "").strip()
     openrouter_proxy_url = env.get("OPENROUTER_PROXY_URL", "").strip() or telegram_proxy_url
+    tavily_proxy_url = env.get("TAVILY_PROXY_URL", "").strip() or telegram_proxy_url
     schedule_profile_rotation = _parse_schedule_profile_rotation(env.get("SCHEDULE_PROFILE_ROTATION"))
     schedule_hour, schedule_minute = _safe_schedule_time(
         env.get("SCHEDULE_TIME"),
@@ -778,6 +780,7 @@ def load_settings() -> dict[str, Any]:
         "followup_max_results": followup_max_results,
         "telegram_proxy_url": telegram_proxy_url,
         "openrouter_proxy_url": openrouter_proxy_url,
+        "tavily_proxy_url": tavily_proxy_url,
         "schedule_profile_rotation": schedule_profile_rotation,
         "schedule_hour": schedule_hour,
         "schedule_minute": schedule_minute,
@@ -804,6 +807,7 @@ async def main() -> None:
     configure_telegram_proxy(settings["telegram_proxy_url"])
     configure_telegram_feed_proxy(settings["telegram_proxy_url"])
     configure_openrouter_proxy(settings["openrouter_proxy_url"])
+    configure_tavily_proxy(settings["tavily_proxy_url"])
     db_init(DB_PATH)
     startup_now = datetime.now(settings["tz"])
     elapsed_slot = (
@@ -841,6 +845,10 @@ async def main() -> None:
     print(
         "[startup] OpenRouter proxy: "
         + (mask_proxy_url(settings["openrouter_proxy_url"]) if settings["openrouter_proxy_url"] else "disabled")
+    )
+    print(
+        "[startup] Tavily proxy: "
+        + (mask_proxy_url(settings["tavily_proxy_url"]) if settings["tavily_proxy_url"] else "disabled")
     )
     print(
         "[startup] OpenRouter filter: "
